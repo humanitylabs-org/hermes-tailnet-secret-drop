@@ -1,44 +1,23 @@
 # Draft: Give this prompt to your AI
 
-Proposed copy for the Humanity Labs card. The `v1.0.0` tag must exist and be reviewed before this prompt is published.
+The fenced text below is the exact proposed Humanity Labs copy prompt.
 
 ```text
-Install Hermes Tailnet Secret Drop v1.0.0 from https://github.com/humanitylabs-org/hermes-tailnet-secret-drop on this Hermes device.
+Install Hermes Tailnet Secret Drop v1.0.0 from https://github.com/humanitylabs-org/hermes-tailnet-secret-drop on this Hermes device. It gives me a private, one-time Tailnet page for entering API keys, tokens, passwords, and private URLs without pasting them into AI chat.
 
-Goal: give me a private, one-time Tailnet page where I can enter API keys, tokens, passwords, credentials, and private URLs without pasting the raw value into AI chat. This protects the chat/transcript boundary; do not claim it hides agent-usable secrets from the Hermes host.
+Complete and verify the installation:
 
-Please complete this safely and verify each step:
-1) Confirm this is a Linux host with Python 3.10+, git, systemd user services, and a working Hermes Agent installation. If Hermes is missing or unhealthy, use the official docs at https://hermes-agent.nousresearch.com/docs and fix one prerequisite at a time.
-2) Treat Tailscale as mandatory. Check whether the Tailscale CLI is installed, connected, and has a `.ts.net` MagicDNS name.
-   - If Tailscale is missing, explain that Secret Drop is private because it is reachable only through the user's tailnet. Point me to https://tailscale.com/download and offer the official Linux quick install: `curl -fsSL https://tailscale.com/install.sh | sh`. Ask for my approval before running that installer, sudo, or any package-manager command.
-   - If Tailscale is installed but disconnected, run or propose `sudo tailscale up`, ask before sudo, give me the sign-in link or action, and wait for me to finish authentication.
-   - Re-check Tailscale after every fix. Do not use Tailscale Funnel.
-3) Install the reviewed release, not an arbitrary moving branch:
-   - If no checkout exists, clone the repo at tag `v1.0.0` into a normal local projects folder.
-   - If a checkout already exists, require a clean working tree, fetch tags, and check out `v1.0.0`. If it has unrelated local changes, stop and explain instead of overwriting them.
-   - Verify `git describe --tags --exact-match` returns `v1.0.0`.
-4) From the repo, run `./scripts/prereq-check.sh`. If it reports a missing prerequisite, use its Suggested safe fixes one at a time, ask before privileged/package-manager actions, and rerun the check after each fix.
-5) Run `./scripts/setup.sh`. It should install or update the user service, install the `hermes-secret-drop` command and Hermes skill, configure private Tailnet HTTPS, verify health, and create a disposable demo link. It must never enable Funnel.
-6) Verify the real installation:
-   - `systemctl --user is-enabled hermes-tailnet-secret-drop.service`
-   - `systemctl --user is-active hermes-tailnet-secret-drop.service`
-   - `hermes-secret-drop health`
-   - the returned private Tailnet `/health` URL returns status `ok`
-   - the service is exposed only through Tailscale Serve or a TLS listener bound to the device's Tailscale IP, never a public interface
-   - the public base route, `/requests`, `/secrets`, and `/env` do not list or reveal anything
-7) Create a fresh disposable demo with `hermes-secret-drop demo` if setup did not already return one. Send me the clickable `request_url` and tell me to enter only a fake value. The demo must discard the submitted value, work once, expire within 15 minutes, and retire its active request after use or expiration.
-8) In your final feedback, introduce the feature in plain English: Secret Drop lets Hermes ask me for a credential through a private one-time Tailnet page so the raw value never has to appear in chat. State honestly that values saved for Hermes remain readable by the Hermes host account. Include the demo link, its expiration, installed mode, health evidence, and these examples:
-   - demo: `hermes-secret-drop demo`
-   - real request: `hermes-secret-drop create --key EXAMPLE_API_KEY --label "Example API key"`
-   - uninstall: `python3 scripts/uninstall.py` from the repo
-9) After I test the demo, verify only sanitized state. Confirm the demo value was discarded and the active link is gone; never inspect, print, or repeat what I typed.
+1. Check for Linux, Python 3.10+, git, systemd user services, Hermes Agent, and Tailscale. Tailscale is mandatory and must be connected with MagicDNS. If it is missing, explain why Secret Drop needs a tailnet, point me to https://tailscale.com/download, and offer the official Linux install command: `curl -fsSL https://tailscale.com/install.sh | sh`. Ask before running that command, sudo, or any package-manager action. If Tailscale needs authentication, help me run `sudo tailscale up`, ask before sudo, and wait for me to complete sign-in. Never enable Funnel.
 
-Rules:
-- Never ask me to paste a real credential into chat.
-- Never print existing `.env` contents or secret values.
-- Never put a secret in a URL, query string, fragment, command-line argument, log, test fixture, or response.
-- Do not add a read/list/export/reveal endpoint.
-- Do not use Funnel or expose the service on a public interface.
-- Do not claim success until the service and private Tailnet health checks pass.
-- Preserve unrelated Hermes configuration and existing `.env` entries.
+2. Clone the repository at reviewed tag `v1.0.0`, or safely update an existing clean checkout to that tag. Do not overwrite unrelated local changes. Verify `git describe --tags --exact-match` returns `v1.0.0`.
+
+3. Run `./scripts/prereq-check.sh`, fix missing requirements one safe step at a time, then run `./scripts/setup.sh`.
+
+4. Verify the user service is enabled and active, `hermes-secret-drop health` passes, and the private Tailnet `/health` URL returns `ok`. Confirm exposure uses Tailscale Serve or TLS bound only to the device's Tailscale IP—not a public interface—and that no list, retrieval, export, or reveal endpoint exists.
+
+5. Create a disposable demo with `hermes-secret-drop demo`. Send me its clickable link and tell me to enter only a fake value. The demo must discard the value, work once, expire within 15 minutes, and remove its active request after use or expiration.
+
+In your final response, explain that Secret Drop lets Hermes request credentials through a private one-time page so raw values stay out of chat. State honestly that saved credentials remain readable by the Hermes host account. Include the demo link, expiration, installed mode, health evidence, this real-request example—`hermes-secret-drop create --key EXAMPLE_API_KEY --label "Example API key"`—and the uninstall command: `python3 scripts/uninstall.py`.
+
+Never ask me to paste a real credential into chat, print existing `.env` contents, put secrets in URLs or command arguments, use Funnel, expose a public listener, or claim success before verification. Preserve unrelated Hermes configuration and `.env` entries. After I test the demo, verify only sanitized status and confirm the demo value was discarded and the active link is gone.
 ```
