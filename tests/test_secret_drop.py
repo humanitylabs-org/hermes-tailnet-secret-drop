@@ -237,6 +237,67 @@ class SecretDropTests(unittest.TestCase):
         self.assertEqual(state["status"], "pending")
         self.assertFalse(self.env.exists())
 
+    def test_retirement_failure_never_writes_the_environment(self):
+        created = self.create()
+        token = created["request_id"]
+        with patch.object(secret_drop, "retire_request", side_effect=OSError("retirement failed")):
+            with self.assertRaises(secret_drop.SecretDropError) as caught:
+                secret_drop.consume_request(self.config, token, "fake-secret")
+
+        self.assertNotIn("retirement failed", str(caught.exception))
+        _, state = secret_drop.load_request(self.config, token)
+        self.assertEqual(state["status"], "pending")
+        self.assertFalse(self.env.exists())
+
+    def test_request_directory_is_synced_before_the_environment_write(self):
+        created = self.create()
+        token = created["request_id"]
+        events = []
+        real_fsync_directory = secret_drop.fsync_directory
+
+        def record_fsync(path):
+            events.append(f"fsync:{Path(path).name}")
+            real_fsync_directory(path)
+
+        def record_environment_write(*_args):
+            events.append("environment-write")
+
+        with patch.object(secret_drop, "fsync_directory", side_effect=record_fsync):
+            with patch.object(secret_drop, "atomic_update_env", side_effect=record_environment_write):
+                secret_drop.consume_request(self.config, token, "fake-secret")
+
+        self.assertLess(events.index("fsync:requests"), events.index("environment-write"))
+
+    def test_request_directory_sync_failure_prevents_environment_write(self):
+        created = self.create()
+        token = created["request_id"]
+
+        def fail_request_sync(path):
+            if Path(path).name == "requests":
+                raise OSError("private-path")
+
+        with patch.object(secret_drop, "fsync_directory", side_effect=fail_request_sync):
+            with patch.object(secret_drop, "atomic_update_env") as environment_write:
+                with self.assertRaises(secret_drop.SecretDropError) as caught:
+                    secret_drop.consume_request(self.config, token, "fake-secret")
+
+        environment_write.assert_not_called()
+        self.assertNotIn("private-path", str(caught.exception))
+
+    def test_environment_write_failure_still_destroys_the_link(self):
+        created = self.create()
+        token = created["request_id"]
+        with patch.object(secret_drop, "atomic_update_env", side_effect=OSError("private-path")):
+            with self.assertRaises(secret_drop.SecretDropError) as caught:
+                secret_drop.consume_request(self.config, token, "fake-secret")
+
+        self.assertNotIn("private-path", str(caught.exception))
+        self.assertFalse(secret_drop.request_path(self.state, token).exists())
+        self.assertEqual(secret_drop.load_tombstone(self.config, token)["status"], "consumed")
+        self.assertFalse(self.env.exists())
+        with self.assertRaises(secret_drop.SecretDropError):
+            secret_drop.consume_request(self.config, token, "fake-secret")
+
     def test_expired_request_is_retired_and_cannot_be_used(self):
         created = self.create()
         token = created["request_id"]

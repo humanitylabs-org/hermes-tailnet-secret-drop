@@ -1,6 +1,6 @@
-# Draft: Give this prompt to your AI
+# Give this prompt to your AI
 
-The fenced text below is the exact proposed Humanity Labs copy prompt.
+The fenced text below is the exact Humanity Labs copy prompt.
 
 ```text
 Install Hermes Tailnet Secret Drop v1.0.0 from https://github.com/humanitylabs-org/hermes-tailnet-secret-drop on this Hermes device. It gives me a private, one-time Tailnet page for entering API keys, tokens, passwords, and private URLs without pasting them into AI chat.

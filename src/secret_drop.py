@@ -33,7 +33,7 @@ from typing import Any
 from urllib.parse import parse_qs, quote, urlsplit
 from urllib.request import Request, urlopen
 
-APP_VERSION = "1.0.0-draft"
+APP_VERSION = "1.0.0"
 DEFAULT_TTL_MINUTES = 15
 MAX_TTL_MINUTES = 15
 CLEANUP_INTERVAL_SECONDS = 30
@@ -157,6 +157,14 @@ def ensure_private_dir(path: Path) -> None:
     os.chmod(path, 0o700)
 
 
+def fsync_directory(path: Path) -> None:
+    directory_fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
 def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
     ensure_private_dir(path.parent)
     fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
@@ -169,6 +177,7 @@ def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
             os.fsync(handle.fileno())
         os.replace(temp_name, path)
         os.chmod(path, 0o600)
+        fsync_directory(path.parent)
     except Exception:
         try:
             os.unlink(temp_name)
@@ -408,7 +417,12 @@ def retire_request(
     completed_at = isoformat(utc_now())
     request["status"] = status_value
     request["completed_at"] = completed_at
-    request["result"] = "discarded" if request.get("mode") == "demo" else "saved"
+    if status_value == "expired":
+        request["result"] = "expired"
+    elif request.get("mode") == "demo":
+        request["result"] = "discarded"
+    else:
+        request["result"] = "consumed"
     tombstone = {
         "version": 1,
         "status": status_value,
@@ -422,6 +436,7 @@ def retire_request(
         path.unlink()
     except FileNotFoundError:
         pass
+    fsync_directory(path.parent)
     return request_public_status(request)
 
 
@@ -536,10 +551,25 @@ def consume_request(config: dict[str, Any], token: str, submitted_value: str) ->
             raise SecretDropError("This Secret Drop request is not configured correctly.", HTTPStatus.INTERNAL_SERVER_ERROR)
         validator, _ = validator_entry
         value = validator(submitted_value)
-        if request.get("mode") != "demo":
-            atomic_update_env(Path(config["env_path"]), str(request["env_key"]), value, state_dir)
+        try:
+            retired = retire_request(config, path, request, "consumed")
+        except Exception:
+            raise SecretDropError(
+                "The request could not be secured for one-time use. Try again.",
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+            ) from None
+        if request.get("mode") == "demo":
+            return retired
 
-        return retire_request(config, path, request, "consumed")
+        try:
+            atomic_update_env(Path(config["env_path"]), str(request["env_key"]), value, state_dir)
+        except Exception:
+            raise SecretDropError(
+                "The submitted value could not be saved. Create a new Secret Drop request and try again.",
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+            ) from None
+        retired["result"] = "saved"
+        return retired
 
 
 def page_shell(title: str, body: str) -> bytes:

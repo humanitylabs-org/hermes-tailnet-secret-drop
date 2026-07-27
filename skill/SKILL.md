@@ -1,7 +1,7 @@
 ---
 name: hermes-tailnet-secret-drop
 description: Create private, one-time Tailnet links so a user can enter agent credentials without pasting them into chat.
-version: 1.0.0-draft
+version: 1.0.0
 author: Humanity Labs
 license: MIT
 platforms: [linux]

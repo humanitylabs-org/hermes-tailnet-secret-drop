@@ -39,4 +39,4 @@ For use-without-raw-read semantics, place the credential behind a separately pri
 
 ## Reporting a vulnerability
 
-Do not open a public issue containing a credential, live request URL, private hostname, certificate, local path, or exploit payload tied to a real system. Use the security contact published by Humanity Labs when this project is released.
+Do not open a public issue containing a credential, live request URL, private hostname, certificate, local path, or exploit payload tied to a real system. Use this repository's private **Report a vulnerability** flow instead.

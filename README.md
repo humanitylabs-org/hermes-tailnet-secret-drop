@@ -103,4 +103,4 @@ Read [SECURITY.md](SECURITY.md) before adapting the service. Core guarantees are
 
 ## Give this prompt to your AI
 
-The proposed Humanity Labs install prompt is in [docs/give-this-prompt-to-your-ai.md](docs/give-this-prompt-to-your-ai.md). It is a draft until the repository and release are approved and published.
+The Humanity Labs install prompt is in [docs/give-this-prompt-to-your-ai.md](docs/give-this-prompt-to-your-ai.md).
