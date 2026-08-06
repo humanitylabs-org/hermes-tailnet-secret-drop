@@ -4,6 +4,8 @@ A private, one-time credential handoff for Hermes Agent.
 
 Secret Drop gives Hermes a temporary Tailnet-only page where you can enter an API key, token, password, credential, or private URL without pasting that value into chat. The page accepts one value and never provides a list, reveal, export, or retrieval screen.
 
+The link's capability lives only in the URL fragment, the service stores only its hash, submissions must come from the service's own origin, and an older link can never overwrite a credential a newer link was issued for.
+
 ## Why it exists
 
 Anything pasted into an AI chat should be treated as shared with that AI and potentially retained in transcripts. Secret Drop moves credential entry into a small deterministic web service on your own Tailscale network. Hermes receives only the harmless request link and sanitized state.
@@ -43,35 +45,52 @@ Open the returned link and use a fake value. Demo submissions are discarded rath
 
 ## Create a real request
 
+A provider adapter is the safest form. It fixes the environment key, the label, and a real provider validator in one flag:
+
+```bash
+hermes-secret-drop create --adapter openrouter-hermes
+```
+
+Generic requests still work exactly as before:
+
 ```bash
 hermes-secret-drop create \
-  --key OPENROUTER_API_KEY \
-  --label "OpenRouter API key" \
+  --key EXAMPLE_API_KEY \
+  --label "Example API key" \
   --validator opaque
 ```
 
-Send only `request_url` to the user. The link contains a random request identifier, never the secret. The browser sends the value in an HTTPS POST body.
+Send only `request_url` to the user, and send it whole. The capability that authorizes the entry page lives in the URL fragment (`https://<node>.ts.net:8805/#token=…`), which browsers never place in a request line, so it is not in server logs, proxy logs, or the `Referer` header. The page reads the fragment, erases it from history with `history.replaceState`, and replays it in an `X-Secret-Drop-Token` header on same-origin API calls. Only the SHA-256 digest of the capability is stored on disk.
 
-Supported validators:
+`request_id` is that digest. It is safe to keep for `status` checks and never reveals the capability. The form says **Save** for syntax-only `opaque` requests and **Save & verify** only when it will perform a real validator check.
 
-- `opaque`: a non-empty single-line secret
-- `google-calendar-ics`: a private Google Calendar ICS URL with bounded validation
+Validators:
 
-Environment names are constrained to uppercase secret-like keys. The browser cannot choose the key, destination, validator, command, or file path.
+| Validator | Selected by | What it proves |
+| --- | --- | --- |
+| `opaque` | `--validator opaque` (default) | Syntax only: one non-empty, single-line, storable value. It does **not** contact any provider. |
+| `google-calendar-ics` | `--validator google-calendar-ics` | The URL is a private Google Calendar ICS feed, checked with a bounded fetch. |
+| `openrouter-api-key` | `--adapter openrouter-hermes` | The key is accepted by OpenRouter, checked with a bounded, read-only `GET https://openrouter.ai/api/v1/key`. |
+
+Provider validation is available only through an adapter, so a generic request can never imply a verification it did not perform. Environment names are constrained to uppercase secret-like keys. The browser cannot choose the adapter, key, destination, validator, command, or file path.
 
 ## Link lifecycle
 
 - Hard server-side lifetime: 15 minutes maximum
 - Single use: successful submission retires the active request immediately
+- Supersession: creating a new request for an environment key retires older pending requests for that same key as `superseded`, so a stale link can never overwrite a newer credential
+- Ordering: issuing, retirement, and delivery share one process-safe lifecycle lock; a submission still in provider validation when a newer request is issued is refused instead of committing
+- Validation first: a value is verified before the existing `.env` entry is touched, so a rejected value leaves the previous credential byte-for-byte intact and leaves the link usable for a corrected submission
 - Expiration: a background cleanup loop retires expired active requests
-- Status: short-lived hashed tombstones contain only sanitized state and are purged automatically
-- Base service: health and one-time request routes only; there is no request list or secret retrieval endpoint
+- Status: short-lived tombstones keyed by the capability digest contain only sanitized state and are purged automatically
+- Routes: `/` (generic app shell), `/health`, `/api/request` (metadata), `/api/secret` (submission). There is no request list, retrieval, or reveal endpoint.
 
 ## Commands
 
 ```bash
 hermes-secret-drop health
 hermes-secret-drop demo
+hermes-secret-drop create --adapter openrouter-hermes
 hermes-secret-drop create --key EXAMPLE_API_KEY --label "Example API key"
 hermes-secret-drop status <request-id>
 hermes-secret-drop cleanup
@@ -96,6 +115,17 @@ python3 scripts/uninstall.py
 ```
 
 Uninstall stops the service, removes its Tailnet listener, destroys active request metadata, and removes the local package and skill. It does **not** delete secrets already saved in the Hermes `.env`.
+
+## What changed in 1.1.0
+
+Intentional, breaking changes to the machine-readable contract:
+
+- `request_url` is now `https://<node>.ts.net:<port>/#token=<capability>`. The old `/r/<token>` route is removed.
+- `request_id` is now the SHA-256 digest of the capability rather than the capability itself. It is still the argument to `status`, and it is now safe to log or keep.
+- HTTP routes are `/`, `/health`, `/api/request`, and `/api/secret`. Submission is `application/json` with an `X-Secret-Drop-Token` header and an exactly matching `Origin`.
+- `create` output adds `env_key`, `adapter`, `validator`, and `superseded_requests`. `status` may now report `superseded`.
+
+Unchanged: `expires_at`, `status`, `mode`, `label`, the 15-minute cap, demo behaviour, the `opaque` and `google-calendar-ics` validators, and the installer and uninstaller contracts.
 
 ## Security
 
