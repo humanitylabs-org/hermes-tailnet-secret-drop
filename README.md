@@ -108,6 +108,8 @@ git pull --ff-only
 
 Setup is idempotent and preserves the configured Hermes environment file.
 
+Upgrading from v1.0 intentionally invalidates and removes any still-pending v1.0 request files when the service starts. Those old URLs are incompatible with v1.1, and removing them clears the legacy format that stored the capability in local request state.
+
 ## Uninstall
 
 ```bash

@@ -21,6 +21,7 @@ Hermes Tailnet Secret Drop is a narrow write-only credential intake service.
 - The random capability that authorizes one intake appears only in the URL fragment (`/#token=<capability>`). Fragments are not sent to servers, so the capability never appears in a request line, access log, proxy log, or `Referer` header.
 - The entry page reads the fragment, removes it from browser history with `history.replaceState`, and replays it in a fixed `X-Secret-Drop-Token` header on same-origin API calls.
 - Only `SHA-256(capability)` is written to disk. It is the request filename, the tombstone filename, and the `request_id` the CLI reports. No plaintext capability exists in active metadata, filenames, tombstones, logs, or error messages.
+- On a v1.0 upgrade, startup invalidates and removes legacy active request files before the service begins listening, clearing the old format that stored plaintext capabilities in local state.
 - The capability cannot be recovered from anything the CLI prints except the original `request_url`.
 
 ### Origin enforcement

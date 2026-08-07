@@ -916,6 +916,28 @@ class LifecycleTests(SecretDropTestCase):
         self.assertEqual(result["tombstones_removed"], 1)
         self.assertFalse(tombstone_path.exists())
 
+    def test_cleanup_removes_legacy_v1_plaintext_capability_state(self):
+        capability = "L" * 43
+        requests_dir = self.state / "requests"
+        secret_drop.ensure_private_dir(requests_dir)
+        legacy_path = requests_dir / f"{capability}.json"
+        secret_drop.atomic_write_json(
+            legacy_path,
+            {
+                "version": 1,
+                "request_id": capability,
+                "status": "pending",
+                "expires_at": secret_drop.isoformat(secret_drop.utc_now() + timedelta(minutes=10)),
+            },
+        )
+        legacy_lock = self.state / "locks" / f"{secret_drop.capability_digest(capability)}.lock"
+
+        result = secret_drop.cleanup_requests(self.config)
+
+        self.assertEqual(result["requests_retired"], 1)
+        self.assertFalse(legacy_path.exists())
+        self.assertFalse(legacy_lock.exists())
+
     def test_google_calendar_validator_checks_calendar_without_returning_content(self):
         url = "https://calendar.google.com/calendar/ical/example/private-token/basic.ics"
         with patch.object(secret_drop, "urlopen", return_value=FakeCalendarResponse()):

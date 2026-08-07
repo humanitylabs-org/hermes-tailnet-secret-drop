@@ -1293,6 +1293,30 @@ def cleanup_requests(
         if requests_dir.exists():
             for path in requests_dir.glob("*.json"):
                 request_id = path.stem
+                if not REQUEST_ID_RE.fullmatch(request_id) and TOKEN_RE.fullmatch(request_id):
+                    # v1.0 stored the plaintext capability in both the filename and
+                    # payload. Those links are incompatible with v1.1, so retire the
+                    # legacy file without parsing it. Take the old per-request lock
+                    # first in case cleanup overlaps an in-flight v1.0 process.
+                    legacy_lock_path = state_dir / "locks" / f"{capability_digest(request_id)}.lock"
+                    try:
+                        with exclusive_lock(legacy_lock_path):
+                            path.unlink()
+                            fsync_directory(requests_dir)
+                        try:
+                            legacy_lock_path.unlink()
+                            fsync_directory(legacy_lock_path.parent)
+                        except OSError:
+                            pass
+                        retired += 1
+                    except FileNotFoundError:
+                        pass
+                    except OSError:
+                        raise SecretDropError(
+                            "Legacy Secret Drop request state could not be removed.",
+                            HTTPStatus.INTERNAL_SERVER_ERROR,
+                        ) from None
+                    continue
                 if not REQUEST_ID_RE.fullmatch(request_id):
                     continue
                 try:
