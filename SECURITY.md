@@ -36,7 +36,7 @@ Hermes Tailnet Secret Drop is a narrow write-only credential intake service.
 - OpenRouter validation rejects wrong prefixes and characters locally before any network call, then performs one bounded, non-mutating `GET https://openrouter.ai/api/v1/key` with bearer authorization and `Accept: application/json`.
 - HTTP, network, and JSON failures are mapped to fixed messages. The submitted key and the upstream response body are never reflected into a response, an exception, or a log.
 - Validation completes before the existing `.env` value is replaced. A rejected value leaves the previous credential byte-for-byte intact and leaves the request usable for a corrected submission.
-- Generic `opaque` validation is described honestly: it verifies only that the value is a safe, non-empty, single-line string. Provider verification requires the adapter.
+- Generic `opaque` validation is described honestly: it verifies only that the value is a safe, non-empty, single-line string. API-key or account verification requires an adapter; the specialized Google Calendar URL/feed validator remains available generically.
 
 ### Stale-write protection
 

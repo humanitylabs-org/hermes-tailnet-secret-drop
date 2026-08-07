@@ -72,7 +72,7 @@ Validators:
 | `google-calendar-ics` | `--validator google-calendar-ics` | The URL is a private Google Calendar ICS feed, checked with a bounded fetch. |
 | `openrouter-api-key` | `--adapter openrouter-hermes` | The key is accepted by OpenRouter, checked with a bounded, read-only `GET https://openrouter.ai/api/v1/key`. |
 
-Provider validation is available only through an adapter, so a generic request can never imply a verification it did not perform. Environment names are constrained to uppercase secret-like keys. The browser cannot choose the adapter, key, destination, validator, command, or file path.
+API-key or account verification requires an adapter. The specialized `google-calendar-ics` validator remains a generic URL/feed check, while `opaque` contacts no provider. A request must never imply verification it did not perform. Environment names are constrained to uppercase secret-like keys. The browser cannot choose the adapter, key, destination, validator, command, or file path.
 
 ## Link lifecycle
 

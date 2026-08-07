@@ -27,7 +27,8 @@ class DocumentationTests(unittest.TestCase):
         skill = (ROOT / "skill" / "SKILL.md").read_text(encoding="utf-8")
         self.assertIn("Syntax only", readme)
         self.assertIn("does **not** contact any provider", readme)
-        self.assertIn("Provider validation is available only through an adapter", readme)
+        self.assertIn("API-key or account verification requires an adapter", readme)
+        self.assertIn("`google-calendar-ics` validator remains a generic URL/feed check", readme)
         self.assertIn("it contacts no provider", skill)
 
     def test_documentation_explains_the_fragment_capability(self):
