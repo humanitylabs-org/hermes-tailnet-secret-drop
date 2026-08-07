@@ -872,6 +872,25 @@ class LifecycleTests(SecretDropTestCase):
         with self.assertRaises(secret_drop.SecretDropError):
             secret_drop.consume_request(self.config, digest, "fake-secret")
 
+    def test_environment_directory_sync_failure_is_not_reported_as_saved(self):
+        created = self.create()
+        digest = created["request_id"]
+        real_fsync_directory = secret_drop.fsync_directory
+
+        def fail_environment_sync(path):
+            if Path(path) == self.env.parent:
+                raise OSError("private-path")
+            real_fsync_directory(path)
+
+        with patch.object(secret_drop, "fsync_directory", side_effect=fail_environment_sync):
+            with self.assertRaises(secret_drop.SecretDropError) as caught:
+                secret_drop.consume_request(self.config, digest, "fake-secret")
+
+        self.assertNotIn("private-path", str(caught.exception))
+        self.assertFalse(secret_drop.request_path(self.state, digest).exists())
+        self.assertEqual(secret_drop.load_tombstone(self.config, digest)["status"], "consumed")
+        self.assertTrue(self.env.exists())
+
     def test_expired_request_is_retired_and_cannot_be_used(self):
         created = self.create()
         digest = created["request_id"]

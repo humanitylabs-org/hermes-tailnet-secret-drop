@@ -859,14 +859,7 @@ def atomic_update_env(env_path: Path, key: str, value: str, state_dir: Path) -> 
                 os.fsync(handle.fileno())
             os.replace(temp_name, env_path)
             os.chmod(env_path, 0o600)
-            try:
-                dir_fd = os.open(env_path.parent, os.O_RDONLY | os.O_DIRECTORY)
-                try:
-                    os.fsync(dir_fd)
-                finally:
-                    os.close(dir_fd)
-            except OSError:
-                pass
+            fsync_directory(env_path.parent)
         except Exception:
             try:
                 os.unlink(temp_name)

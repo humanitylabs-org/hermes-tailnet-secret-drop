@@ -21,6 +21,21 @@ SPEC.loader.exec_module(installer)
 
 
 class InstallerTests(unittest.TestCase):
+    def test_install_restarts_an_already_running_service(self):
+        completed = subprocess.CompletedProcess(["systemctl"], 0, "", "")
+        with patch.object(installer, "run", return_value=completed) as run_mock:
+            installer.restart_service("/usr/bin/systemctl")
+
+        commands = [call.args[0] for call in run_mock.call_args_list]
+        self.assertEqual(
+            commands,
+            [
+                ["/usr/bin/systemctl", "--user", "daemon-reload"],
+                ["/usr/bin/systemctl", "--user", "enable", installer.SERVICE_NAME],
+                ["/usr/bin/systemctl", "--user", "restart", installer.SERVICE_NAME],
+            ],
+        )
+
     def test_tailscale_identity_requires_running_magicdns_node(self):
         payload = {
             "BackendState": "Running",
