@@ -21,6 +21,21 @@ SPEC.loader.exec_module(installer)
 
 
 class InstallerTests(unittest.TestCase):
+    def test_install_restarts_an_already_running_service(self):
+        completed = subprocess.CompletedProcess(["systemctl"], 0, "", "")
+        with patch.object(installer, "run", return_value=completed) as run_mock:
+            installer.restart_service("/usr/bin/systemctl")
+
+        commands = [call.args[0] for call in run_mock.call_args_list]
+        self.assertEqual(
+            commands,
+            [
+                ["/usr/bin/systemctl", "--user", "daemon-reload"],
+                ["/usr/bin/systemctl", "--user", "enable", installer.SERVICE_NAME],
+                ["/usr/bin/systemctl", "--user", "restart", installer.SERVICE_NAME],
+            ],
+        )
+
     def test_tailscale_identity_requires_running_magicdns_node(self):
         payload = {
             "BackendState": "Running",
@@ -189,8 +204,17 @@ class InstallerTests(unittest.TestCase):
             self.assertEqual(payload["status"], "staged")
             self.assertTrue((install_dir / "secret_drop.py").is_file())
             self.assertTrue((bin_dir / "hermes-secret-drop").is_file())
-            self.assertTrue((hermes_home / "skills" / "hermes-tailnet-secret-drop" / "SKILL.md").is_file())
+            staged_skill = hermes_home / "skills" / "hermes-tailnet-secret-drop" / "SKILL.md"
+            self.assertTrue(staged_skill.is_file())
             self.assertEqual(stat.S_IMODE(state.stat().st_mode), 0o700)
+
+            # The staging model has no in-repo duplicate: the installer copies the
+            # canonical sources, so they must land byte-for-byte identical.
+            self.assertEqual(
+                (install_dir / "secret_drop.py").read_bytes(),
+                (ROOT / "src" / "secret_drop.py").read_bytes(),
+            )
+            self.assertEqual(staged_skill.read_bytes(), (ROOT / "skill" / "SKILL.md").read_bytes())
 
             uninstall_result = subprocess.run(
                 [

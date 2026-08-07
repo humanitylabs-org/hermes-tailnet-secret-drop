@@ -1,7 +1,7 @@
 ---
 name: hermes-tailnet-secret-drop
 description: Create private, one-time Tailnet links so a user can enter agent credentials without pasting them into chat.
-version: 1.0.0
+version: 1.1.0
 author: Humanity Labs
 license: MIT
 platforms: [linux]
@@ -22,7 +22,17 @@ Use this skill when a user needs to add or replace an API key, token, password, 
 hermes-secret-drop health
 ```
 
-2. Create one narrowly named request. The key must be an uppercase environment variable that clearly ends in `_API_KEY`, `_TOKEN`, `_SECRET`, `_PASSWORD`, `_PASS`, `_URL`, `_URI`, or `_CREDENTIAL`.
+2. Create one narrowly named request.
+
+If an adapter exists for the provider, use it. It fixes the key, label, and a real provider check together:
+
+```bash
+hermes-secret-drop create --adapter openrouter-hermes
+```
+
+Available adapters: `openrouter-hermes` (binds `OPENROUTER_API_KEY` and verifies the key with OpenRouter). Do not invent adapter names.
+
+Otherwise create a generic request. The key must be an uppercase environment variable that clearly ends in `_API_KEY`, `_TOKEN`, `_SECRET`, `_PASSWORD`, `_PASS`, `_URL`, `_URI`, or `_CREDENTIAL`.
 
 ```bash
 hermes-secret-drop create \
@@ -31,12 +41,14 @@ hermes-secret-drop create \
   --validator opaque
 ```
 
-Use `--validator google-calendar-ics` only for a private Google Calendar ICS URL. Do not invent validator names.
+Use `--validator google-calendar-ics` only for a private Google Calendar ICS URL. Do not invent validator names. `--adapter` cannot be combined with `--key`, `--label`, or `--validator`; the adapter fixes all three.
 
-3. Send only the returned `request_url` to the user. Never ask the user to paste the value into chat, and never include the request identifier in a summary.
+3. Send only the returned `request_url`, and send it complete. Everything after the `#` is the capability that opens the page; a truncated link will not work. Never ask the user to paste the value into chat, and never include the capability in a summary.
 4. Tell the user the link is Tailnet-only, works once, and expires within 15 minutes. Do not claim it hides the credential from the Hermes host; its purpose is to keep the value out of chat/model transcripts and public web surfaces.
-5. After the user submits, check sanitized state with `hermes-secret-drop status <request-id>` if needed. Never inspect or print the stored value.
-6. If the running Hermes process must pick up a newly written `.env` value, use Hermes's normal `/reload` or safe restart flow.
+5. Be accurate about what was verified. `opaque` checks only that the value is a safe, non-empty, single line; it contacts no provider. Claim a provider verified a key only when an adapter performed that check.
+6. Creating a new request for a key you already requested retires the older pending link for that key as `superseded`. Tell the user to use the newest link.
+7. After the user submits, check sanitized state with `hermes-secret-drop status <request-id>` if needed. The `request_id` is a one-way digest and is safe to keep; it is not the capability. Never inspect or print the stored value.
+8. If the running Hermes process must pick up a newly written `.env` value, use Hermes's normal `/reload` or safe restart flow.
 
 ## Disposable demo
 
@@ -54,9 +66,13 @@ The demo accepts only a fake value. It discards the submitted value instead of w
 - The browser can submit one value but cannot list, retrieve, export, prefill, or reveal stored values.
 - The eye icon shows only the value currently typed in that browser.
 - A link is single-use and has a hard server-side lifetime of at most 15 minutes.
-- Active request metadata never stores the submitted secret. Used and expired request files are retired automatically; short-lived hashed tombstones preserve sanitized status only.
-- The value is sent in an HTTPS POST body, never in the link, query string, fragment, logs, CLI arguments, or response.
-- The browser cannot choose the environment key, destination, validator, command, or file path.
+- The link's capability sits only in the URL fragment, so it never reaches the server in a request line or a log. The service stores only its SHA-256 digest.
+- Active request metadata never stores the submitted secret or the capability. Used, expired, and superseded request files are retired automatically; short-lived tombstones preserve sanitized status only.
+- The value is sent in an HTTPS request body, never in the link, query string, logs, CLI arguments, or response.
+- Submissions are accepted only from the service's own origin.
+- The browser cannot choose the adapter, environment key, destination, validator, command, or file path.
+- A value is verified before the existing `.env` entry is replaced. A rejected value leaves the previous credential intact and the link reusable.
+- An older link can never overwrite a credential after a newer link for the same key has been issued.
 - Secrets are written atomically to the configured Hermes `.env` with restrictive permissions and unrelated entries preserved.
 - Secret Drop keeps credentials out of chat; it does not make an agent-usable secret unreadable to the operating-system account running Hermes.
 

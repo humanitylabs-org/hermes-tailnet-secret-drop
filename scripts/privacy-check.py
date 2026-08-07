@@ -18,7 +18,7 @@ PATTERNS = {
     "GitHub token": re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b"),
     "common API token": re.compile(r"\b(?:sk-|xox[baprs]-)[A-Za-z0-9_-]{20,}\b"),
     "bearer token": re.compile(r"\bBearer\s+[A-Za-z0-9._~+/-]{20,}", re.IGNORECASE),
-    "live Secret Drop link": re.compile(r"https://[^\s/]+\.ts\.net(?::\d+)?/r/[A-Za-z0-9_-]{32,128}"),
+    "live Secret Drop link": re.compile(r"https://[^\s/]+\.ts\.net(?::\d+)?/(?:#token=|r/)[A-Za-z0-9_-]{32,128}"),
 }
 
 

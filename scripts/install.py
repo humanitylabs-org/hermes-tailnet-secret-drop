@@ -363,6 +363,14 @@ def probe_tailnet(base_url: str) -> None:
     raise InstallError(f"Tailnet health endpoint was not reachable ({error_name}).")
 
 
+def restart_service(systemctl_bin: str) -> None:
+    run([systemctl_bin, "--user", "daemon-reload"])
+    run([systemctl_bin, "--user", "enable", SERVICE_NAME])
+    # `enable --now` is a no-op for an already-running service. Always restart
+    # so updates load the newly installed code and invalidate legacy requests.
+    run([systemctl_bin, "--user", "restart", SERVICE_NAME])
+
+
 def install(args: argparse.Namespace) -> dict[str, Any]:
     repo_root = Path(__file__).resolve().parents[1]
     source_script = repo_root / "src" / "secret_drop.py"
@@ -422,8 +430,7 @@ def install(args: argparse.Namespace) -> dict[str, Any]:
     tailscale_bin = shutil.which("tailscale")
     if not systemctl_bin or not tailscale_bin:
         raise InstallError("systemd user services and the Tailscale CLI are required on this Linux package.")
-    run([systemctl_bin, "--user", "daemon-reload"])
-    run([systemctl_bin, "--user", "enable", "--now", SERVICE_NAME])
+    restart_service(systemctl_bin)
     probe_local(wrapper)
 
     mode = "tailscale-serve"
