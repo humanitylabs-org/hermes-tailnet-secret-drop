@@ -24,7 +24,7 @@ It gives Hermes a private way to ask you for an API key, token, password, or pri
 Disposable demo link:
 $demo_url
 
-Use a fake value. The demo discards what you enter. This link works once, expires within 15 minutes, and its active request is removed after use or expiration.
+Use a fake value. The demo discards what you enter. This link works once, expires within two hours, and its active request is removed after use or expiration.
 
 Installed mode: $mode
 Private service: $base_url

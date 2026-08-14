@@ -76,7 +76,7 @@ API-key or account verification requires an adapter. The specialized `google-cal
 
 ## Link lifecycle
 
-- Default server-side lifetime cap: 15 minutes
+- Default server-side lifetime: two hours
 - Private deployments may explicitly set `max_ttl_minutes` up to the five-hour package hard limit
 - Single use: successful submission retires the active request immediately
 - Supersession: creating a new request for an environment key retires older pending requests for that same key as `superseded`, so a stale link can never overwrite a newer credential
@@ -119,6 +119,12 @@ python3 scripts/uninstall.py
 
 Uninstall stops the service, removes its Tailnet listener, destroys active request metadata, and removes the local package and skill. It does **not** delete secrets already saved in the Hermes `.env`.
 
+## What changed in 1.2.0
+
+- Default request and demo lifetime is now two hours.
+- Private deployments may explicitly set `max_ttl_minutes` between 1 and 300 minutes.
+- Links remain Tailnet-only, capability-protected, and single-use.
+
 ## What changed in 1.1.0
 
 Intentional, breaking changes to the machine-readable contract:
@@ -128,7 +134,7 @@ Intentional, breaking changes to the machine-readable contract:
 - HTTP routes are `/`, `/health`, `/api/request`, and `/api/secret`. Submission is `application/json` with an `X-Secret-Drop-Token` header and an exactly matching `Origin`.
 - `create` output adds `env_key`, `adapter`, `validator`, and `superseded_requests`. `status` may now report `superseded`.
 
-Unchanged: `expires_at`, `status`, `mode`, `label`, the default 15-minute cap, demo behaviour, the `opaque` and `google-calendar-ics` validators, and the installer and uninstaller contracts. Private operators may explicitly raise the configured cap to at most five hours.
+At v1.1.0, `expires_at`, `status`, `mode`, `label`, the 15-minute maximum, demo behaviour, the `opaque` and `google-calendar-ics` validators, and the installer and uninstaller contracts remained unchanged.
 
 ## Security
 

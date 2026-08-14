@@ -37,10 +37,10 @@ from urllib.error import HTTPError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener, urlopen
 
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 USER_AGENT = f"Hermes-Tailnet-Secret-Drop/{APP_VERSION}"
-DEFAULT_TTL_MINUTES = 15
-MAX_TTL_MINUTES = 15
+DEFAULT_TTL_MINUTES = 120
+MAX_TTL_MINUTES = 120
 HARD_MAX_TTL_MINUTES = 300
 CLEANUP_INTERVAL_SECONDS = 30
 TOMBSTONE_KEEP_HOURS = 24
