@@ -15,6 +15,7 @@ import threading
 import unittest
 from datetime import timedelta
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.parse import urlsplit
@@ -88,7 +89,7 @@ class SecretDropTestCase(unittest.TestCase):
         self.state = self.root / "state"
         self.env = self.root / ".env"
         self.socket = self.state / "drop.sock"
-        self.config = {
+        self.config: dict[str, Any] = {
             "state_dir": str(self.state),
             "env_path": str(self.env),
             "socket_path": str(self.socket),
@@ -120,7 +121,7 @@ class SecretDropTestCase(unittest.TestCase):
         connection.close()
         return result
 
-    def create(self, ttl=15, key="TEST_CALENDAR_ICS_URL", label="Private calendar ICS URL", validator="opaque"):
+    def create(self, ttl=120, key="TEST_CALENDAR_ICS_URL", label="Private calendar ICS URL", validator="opaque"):
         return secret_drop.create_request(self.config, key, label, validator, ttl)
 
     @staticmethod
@@ -754,11 +755,23 @@ class LifecycleTests(SecretDropTestCase):
         self.assertNotIn("capability", state)
         self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
 
-    def test_request_lifetime_is_hard_capped_at_fifteen_minutes(self):
+    def test_request_lifetime_defaults_to_two_hours(self):
         with self.assertRaises(secret_drop.SecretDropError):
-            self.create(ttl=16)
-        self.assertEqual(secret_drop.DEFAULT_TTL_MINUTES, 15)
-        self.assertEqual(secret_drop.MAX_TTL_MINUTES, 15)
+            self.create(ttl=121)
+        self.assertEqual(secret_drop.DEFAULT_TTL_MINUTES, 120)
+        self.assertEqual(secret_drop.MAX_TTL_MINUTES, 120)
+
+    def test_private_deployment_can_raise_request_lifetime_cap(self):
+        self.config["max_ttl_minutes"] = 300
+        created = self.create(ttl=300)
+        self.assertEqual(created["status"], "pending")
+        with self.assertRaises(secret_drop.SecretDropError):
+            self.create(ttl=301)
+
+    def test_configured_request_lifetime_cannot_exceed_hard_cap(self):
+        self.config["max_ttl_minutes"] = secret_drop.HARD_MAX_TTL_MINUTES + 1
+        with self.assertRaises(secret_drop.SecretDropError):
+            self.create(ttl=120)
 
     def test_write_only_http_flow_saves_once_then_destroys_link(self):
         created = self.create()

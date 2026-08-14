@@ -50,7 +50,7 @@ class DocumentationTests(unittest.TestCase):
             "Ask before running that command, sudo, or any package-manager action",
             "Never enable Funnel",
             "hermes-secret-drop demo",
-            "expire within 15 minutes",
+            "expire within two hours",
             "discarded",
             "active link is gone",
         ):
