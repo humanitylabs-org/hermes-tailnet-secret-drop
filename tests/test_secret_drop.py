@@ -15,6 +15,7 @@ import threading
 import unittest
 from datetime import timedelta
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.parse import urlsplit
@@ -88,7 +89,7 @@ class SecretDropTestCase(unittest.TestCase):
         self.state = self.root / "state"
         self.env = self.root / ".env"
         self.socket = self.state / "drop.sock"
-        self.config = {
+        self.config: dict[str, Any] = {
             "state_dir": str(self.state),
             "env_path": str(self.env),
             "socket_path": str(self.socket),
@@ -759,6 +760,18 @@ class LifecycleTests(SecretDropTestCase):
             self.create(ttl=16)
         self.assertEqual(secret_drop.DEFAULT_TTL_MINUTES, 15)
         self.assertEqual(secret_drop.MAX_TTL_MINUTES, 15)
+
+    def test_private_deployment_can_raise_request_lifetime_cap(self):
+        self.config["max_ttl_minutes"] = 120
+        created = self.create(ttl=120)
+        self.assertEqual(created["status"], "pending")
+        with self.assertRaises(secret_drop.SecretDropError):
+            self.create(ttl=121)
+
+    def test_configured_request_lifetime_cannot_exceed_hard_cap(self):
+        self.config["max_ttl_minutes"] = secret_drop.HARD_MAX_TTL_MINUTES + 1
+        with self.assertRaises(secret_drop.SecretDropError):
+            self.create(ttl=15)
 
     def test_write_only_http_flow_saves_once_then_destroys_link(self):
         created = self.create()

@@ -76,7 +76,8 @@ API-key or account verification requires an adapter. The specialized `google-cal
 
 ## Link lifecycle
 
-- Hard server-side lifetime: 15 minutes maximum
+- Default server-side lifetime cap: 15 minutes
+- Private deployments may explicitly set `max_ttl_minutes` up to the five-hour package hard limit
 - Single use: successful submission retires the active request immediately
 - Supersession: creating a new request for an environment key retires older pending requests for that same key as `superseded`, so a stale link can never overwrite a newer credential
 - Ordering: issuing, retirement, and delivery share one process-safe lifecycle lock; a submission still in provider validation when a newer request is issued is refused instead of committing
@@ -127,7 +128,7 @@ Intentional, breaking changes to the machine-readable contract:
 - HTTP routes are `/`, `/health`, `/api/request`, and `/api/secret`. Submission is `application/json` with an `X-Secret-Drop-Token` header and an exactly matching `Origin`.
 - `create` output adds `env_key`, `adapter`, `validator`, and `superseded_requests`. `status` may now report `superseded`.
 
-Unchanged: `expires_at`, `status`, `mode`, `label`, the 15-minute cap, demo behaviour, the `opaque` and `google-calendar-ics` validators, and the installer and uninstaller contracts.
+Unchanged: `expires_at`, `status`, `mode`, `label`, the default 15-minute cap, demo behaviour, the `opaque` and `google-calendar-ics` validators, and the installer and uninstaller contracts. Private operators may explicitly raise the configured cap to at most five hours.
 
 ## Security
 

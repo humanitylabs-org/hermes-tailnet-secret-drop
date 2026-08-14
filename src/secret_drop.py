@@ -41,6 +41,7 @@ APP_VERSION = "1.1.0"
 USER_AGENT = f"Hermes-Tailnet-Secret-Drop/{APP_VERSION}"
 DEFAULT_TTL_MINUTES = 15
 MAX_TTL_MINUTES = 15
+HARD_MAX_TTL_MINUTES = 300
 CLEANUP_INTERVAL_SECONDS = 30
 TOMBSTONE_KEEP_HOURS = 24
 MAX_SECRET_BYTES = 64 * 1024
@@ -312,7 +313,19 @@ def load_config(path: Path) -> dict[str, Any]:
     ):
         raise SecretDropError("Secret Drop must use a private Tailscale HTTPS URL.", HTTPStatus.INTERNAL_SERVER_ERROR)
     config["public_base_url"] = base
+    configured_max_ttl_minutes(config)
     return config
+
+
+def configured_max_ttl_minutes(config: dict[str, Any]) -> int:
+    """Return the deployment TTL cap, bounded by the package hard limit."""
+    value = config.get("max_ttl_minutes", MAX_TTL_MINUTES)
+    if type(value) is not int or value < 1 or value > HARD_MAX_TTL_MINUTES:
+        raise SecretDropError(
+            f"Secret Drop max_ttl_minutes must be between 1 and {HARD_MAX_TTL_MINUTES}.",
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+        )
+    return value
 
 
 def request_origin(config: dict[str, Any]) -> str:
@@ -656,8 +669,9 @@ def create_request(
     adapter: str | None = None,
 ) -> dict[str, Any]:
     key, label, validator, adapter = resolve_intake(key, label, validator, adapter, demo=demo)
-    if ttl_minutes < 1 or ttl_minutes > MAX_TTL_MINUTES:
-        raise SecretDropError(f"Request lifetime must be between 1 and {MAX_TTL_MINUTES} minutes.")
+    max_ttl_minutes = configured_max_ttl_minutes(config)
+    if ttl_minutes < 1 or ttl_minutes > max_ttl_minutes:
+        raise SecretDropError(f"Request lifetime must be between 1 and {max_ttl_minutes} minutes.")
 
     state_dir = Path(config["state_dir"])
     with lifecycle_lock(state_dir):

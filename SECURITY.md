@@ -6,7 +6,7 @@ Hermes Tailnet Secret Drop is a narrow write-only credential intake service.
 
 - The web surface is reachable only through the user's tailnet.
 - Tailscale Funnel is never configured.
-- Every request is random, single-use, and valid for at most 15 minutes.
+- Every request is random and single-use. Deployments default to a 15-minute cap; private operators may explicitly raise it to the five-hour package hard limit.
 - Secret values are accepted only in an HTTPS request body.
 - Values are never echoed in responses, stored in request metadata, printed by the CLI, included in command-line arguments, or written to application logs.
 - There is no HTTP or CLI operation to list, retrieve, export, prefill, or reveal stored secrets.
