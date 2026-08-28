@@ -46,9 +46,10 @@ class DocumentationTests(unittest.TestCase):
         prompt = text.split("```text\n", 1)[1].split("\n```", 1)[0]
         self.assertLessEqual(len(prompt), 3000)
         for required in (
-            "Tailscale is mandatory",
-            "Ask before running that command, sudo, or any package-manager action",
-            "Never enable Funnel",
+            "recommended Cloudflare Access mode",
+            "ask before running sudo or any package-manager command",
+            "ordinary Cloudflare edge processing sees ciphertext",
+            "Cloudflare still serves the page code",
             "hermes-secret-drop demo",
             "expire within two hours",
             "discarded",

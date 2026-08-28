@@ -1,70 +1,71 @@
 # Security model
 
-Hermes Tailnet Secret Drop is a narrow write-only credential intake service.
+Hermes Secret Drop is a narrow, write-only credential intake service. It supports a loopback-only origin behind Cloudflare Access and Tunnel, and a legacy Tailnet-only HTTPS mode.
 
 ## Intended guarantees
 
-- The web surface is reachable only through the user's tailnet.
-- Tailscale Funnel is never configured.
-- Every request is random and single-use. Deployments default to a two-hour lifetime; private operators may explicitly configure a cap up to the five-hour package hard limit.
-- Secret values are accepted only in an HTTPS request body.
-- Values are never echoed in responses, stored in request metadata, printed by the CLI, included in command-line arguments, or written to application logs.
+- Every request has a random capability, is single-use, defaults to a two-hour lifetime, and cannot exceed the configured five-hour hard cap.
+- The browser encrypts entered values before transmission. The server accepts only the strict encrypted envelope and has no plaintext fallback.
+- Values are never echoed, stored in request metadata, printed by the CLI, placed in command-line arguments, or written to application logs.
 - There is no HTTP or CLI operation to list, retrieve, export, prefill, or reveal stored secrets.
 - The eye control reveals only the value currently typed in the browser.
-- The browser cannot select adapters, environment names, validators, paths, commands, programs, or destinations.
-- Real values are written atomically to the configured Hermes `.env`; unrelated entries are preserved and file permissions are restricted.
-- Demo values are validated and discarded without storage.
-- Used, expired, and superseded active request files are retired. Sanitized status tombstones are keyed by the capability digest and automatically purged.
+- Real values are written atomically to the configured Hermes `.env`; unrelated entries are preserved and permissions remain restrictive.
+- Demo values are decrypted, validated, and discarded without storage.
+- Used, expired, and superseded request files are retired. Short-lived tombstones contain sanitized state only.
 
-### Fragment capability and hash-only storage
+## Application-layer encryption
 
-- The random capability that authorizes one intake appears only in the URL fragment (`/#token=<capability>`). Fragments are not sent to servers, so the capability never appears in a request line, access log, proxy log, or `Referer` header.
-- The entry page reads the fragment, removes it from browser history with `history.replaceState`, and replays it in a fixed `X-Secret-Drop-Token` header on same-origin API calls.
-- Only `SHA-256(capability)` is written to disk. It is the request filename, the tombstone filename, and the `request_id` the CLI reports. No plaintext capability exists in active metadata, filenames, tombstones, logs, or error messages.
-- On a v1.0 upgrade, startup invalidates and removes legacy active request files before the service begins listening, clearing the old format that stored plaintext capabilities in local state.
-- The capability cannot be recovered from anything the CLI prints except the original `request_url`.
+- Each submission uses a new browser-generated AES-256-GCM key and 96-bit IV.
+- The AES key is wrapped with the host's RSA-OAEP/SHA-256 public key. The private RSA key is created once on the VPS, stored as a mode-0600 regular file, and never returned by an HTTP or CLI read operation.
+- Concurrent key generation is serialized through a no-follow, owner-checked private lock; a losing installer cannot delete or replace the winning key.
+- AES-GCM additional authenticated data includes `SHA-256(capability)`, binding ciphertext to the exact one-time request. Moving a valid envelope to another request fails authentication.
+- `POST /api/secret` accepts exactly `version`, `alg`, `enc`, `wrapped_key`, `iv`, and `ciphertext`. Plaintext fields, unknown fields, malformed encoding, tampering, or oversize values fail before request consumption or environment writes.
+- Cloudflare Access mode exposes routing metadata, the capability header, and ciphertext to Cloudflare, but not the entered value during ordinary operation.
 
-### Origin enforcement
+Because Cloudflare serves the HTML and JavaScript, application-layer encryption does not defend against a malicious or compelled edge substituting the page code or public key. Removing that final code-integrity trust requires an independently installed and pinned native client, browser extension, or direct private overlay. This release targets the honest-but-curious intermediary case while keeping browser-first deployment reproducible.
 
-- `POST /api/secret` requires an `Origin` header exactly equal to the scheme and authority of the configured `public_base_url`. Missing, `null`, malformed, or differing origins are refused with 403 before any request state is read, so a refused submission never consumes the request and never writes the environment.
-- `GET /api/request` is capability-protected by the custom header, which a cross-origin page cannot send without a preflight this service never approves. A present but mismatched `Origin` is refused.
-- Responses carry `no-store`, `no-referrer`, `nosniff`, `DENY` framing, and a restrictive CSP whose `script-src` pins the exact SHA-256 hash of the one inline script.
+## Fragment capability and hash-only storage
 
-### Provider-bound adapters
+- The random capability appears only in the URL fragment (`/#token=<capability>`). Fragments are not sent in request lines, proxy logs, or `Referer` headers.
+- The page reads the fragment, removes it from browser history with `history.replaceState`, and sends it only in `X-Secret-Drop-Token` on same-origin API calls.
+- Only `SHA-256(capability)` is written to disk. It is the active-request filename, tombstone filename, request binding, and sanitized `request_id`.
+- Startup removes incompatible legacy request files that stored plaintext capabilities.
 
-- An adapter fixes the environment key, label, and validator together; `--adapter openrouter-hermes` binds `OPENROUTER_API_KEY` to the OpenRouter validator.
-- OpenRouter validation rejects wrong prefixes and characters locally before any network call, then performs one bounded, non-mutating `GET https://openrouter.ai/api/v1/key` with bearer authorization and `Accept: application/json`.
-- HTTP, network, and JSON failures are mapped to fixed messages. The submitted key and the upstream response body are never reflected into a response, an exception, or a log.
-- Validation completes before the existing `.env` value is replaced. A rejected value leaves the previous credential byte-for-byte intact and leaves the request usable for a corrected submission.
-- Generic `opaque` validation is described honestly: it verifies only that the value is a safe, non-empty, single-line string. API-key or account verification requires an adapter; the specialized Google Calendar URL/feed validator remains available generically.
+## Origin and browser enforcement
 
-### Stale-write protection
+- `POST /api/secret` requires exactly one `Origin` header matching the scheme and authority of `public_base_url`. Refused submissions do not consume request state.
+- `GET /api/request` requires the capability header. A foreign origin is rejected, and this service never approves a cross-origin preflight.
+- Responses use `no-store`, `no-referrer`, `nosniff`, `DENY` framing, and a restrictive CSP that pins the exact inline-script SHA-256 hash.
+- Cloudflare Access mode requires the configured public URL to equal `access_protected_public_base_url`, while the origin listener must be exactly IPv4 loopback. Direct TLS and loopback HTTP modes cannot be combined.
 
-- Issuing, retirement, and delivery are serialized by one process-safe lifecycle lock (`flock` plus an in-process reentrant guard). Lock order is always lifecycle then environment write, so no lock cycle exists.
-- Creating a request for an environment key durably retires older pending requests for that same key as `superseded` before the replacement is issued.
-- Provider validation runs outside the lock, then the request is re-checked under the lock before delivery. A submission still validating when a newer request is issued is refused rather than committed, so an older intake can never overwrite a newer credential.
-- Pending requests for different environment keys remain usable concurrently.
+## Provider-bound adapters and bundles
 
-## Explicit non-goals
+- An adapter fixes the environment key, label, and validator together. `openrouter-hermes` binds `OPENROUTER_API_KEY` to the OpenRouter validator.
+- Provider and transport errors map to fixed messages; submitted values and upstream bodies are never reflected.
+- Validation completes before the previous `.env` value is replaced. A rejected value preserves the old credential and leaves the request reusable.
+- `create-bundle` writes all fields atomically. Missing, unexpected, invalid, or oversized fields write nothing and do not consume the request.
+- Generic `opaque` validation proves only that a value is safe, non-empty, and single-line. Provider verification requires an adapter.
 
-Secret Drop keeps raw credentials out of AI chat/model transcripts and public web surfaces. It does not hide an agent-usable secret from the operating-system account that runs Hermes. If that account can use or read the configured `.env`, it can technically access the value.
+## Stale-write protection
 
-For use-without-raw-read semantics, place the credential behind a separately privileged broker that exposes only narrow operations. That is outside this package.
+- Issuing, retirement, and delivery share one process-safe lifecycle lock. Lock order is lifecycle then environment write.
+- A new request durably supersedes older pending requests that overlap any destination key.
+- Provider validation runs outside the lifecycle lock, then request identity and fields are rechecked under the lock before delivery. An older slow submission cannot overwrite a newer request.
 
-## Trust assumptions
+## Trust assumptions and non-goals
 
-- Tailnet membership is sufficient user authentication for the intended deployment.
-- The Hermes host, the operating-system user running the service, and Tailscale control plane are trusted.
-- The local machine is maintained and receives security updates.
-- The user reviews privileged/package-manager actions before approval.
+Secret Drop keeps raw credentials out of AI chat/model transcripts and ordinary Cloudflare edge plaintext processing. It does not hide an agent-usable secret from the VPS, the operating-system account running Hermes, a separately compromised browser, or a malicious code-serving edge. For use-without-raw-read semantics, place credentials behind a separately privileged capability broker.
+
+The Hostinger/VPS account, operating-system user, local encryption private key, and browser device are trusted. Cloudflare Access authenticates the user and Tunnel carries traffic to loopback; Cloudflare is not expected to see plaintext during ordinary operation but remains trusted for page-code integrity.
 
 ## Deployment boundaries
 
-- Linux and systemd user services are the supported first-release platform.
-- The service prefers Tailscale Serve on a dedicated HTTPS port.
-- When Serve configuration is unavailable, the fallback binds TLS only to the device's Tailscale IPv4 address.
-- Only four fixed routes exist: `/` (a generic app shell with no request data), `/health`, `/api/request`, and `/api/secret`. There is no per-capability path and no list, retrieval, or reveal route.
+- Linux and systemd user services are supported.
+- Recommended WizardOS mode: exact Cloudflare Access application and Tunnel route to `127.0.0.1:<port>`.
+- Migration removes an old Tailscale Serve listener only after its exact hostname, port, root handler, and Unix-socket target match the installer-owned record; mismatches fail closed and unrelated Serve routes are never reset.
+- Legacy mode: Tailscale Serve on a dedicated HTTPS port, or TLS bound only to the device's Tailscale address. Funnel is never enabled.
+- Only `/`, `/health`, `/api/request`, and `/api/secret`, relative to the configured public base path, exist. In Cloudflare mode the corresponding bare origin paths return 404. There is no per-capability path and no list, retrieval, or reveal route.
 
 ## Reporting a vulnerability
 
-Do not open a public issue containing a credential, live request URL, private hostname, certificate, local path, or exploit payload tied to a real system. Use this repository's private **Report a vulnerability** flow instead.
+Do not open a public issue containing a credential, live request URL, private hostname, certificate, local path, or exploit payload tied to a real system. Use the repository's private **Report a vulnerability** flow instead.

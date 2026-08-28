@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tailnet-only, one-time, write-only secret entry for Hermes.
+"""Private one-time, write-only secret entry for Her...[truncated]
 
 The browser can submit a new value but no HTTP or CLI surface can retrieve one.
 The random capability that authorizes one intake lives only in the URL fragment,
@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import binascii
 import fcntl
 import hashlib
 import html
@@ -37,7 +38,12 @@ from urllib.error import HTTPError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener, urlopen
 
-APP_VERSION = "1.2.0"
+from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding, rsa
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+APP_VERSION = "1.3.0"
 USER_AGENT = f"Hermes-Tailnet-Secret-Drop/{APP_VERSION}"
 DEFAULT_TTL_MINUTES = 120
 MAX_TTL_MINUTES = 120
@@ -45,7 +51,9 @@ HARD_MAX_TTL_MINUTES = 300
 CLEANUP_INTERVAL_SECONDS = 30
 TOMBSTONE_KEEP_HOURS = 24
 MAX_SECRET_BYTES = 64 * 1024
-MAX_BODY_BYTES = MAX_SECRET_BYTES + 4096
+MAX_BUNDLE_FIELDS = 16
+MAX_PLAINTEXT_BYTES = MAX_SECRET_BYTES + 4096
+MAX_BODY_BYTES = 128 * 1024
 MAX_ENV_BYTES = 10 * 1024 * 1024
 MAX_CALENDAR_BYTES = 16 * 1024 * 1024
 TOKEN_HEADER = "X-Secret-Drop-Token"
@@ -53,6 +61,12 @@ TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{32,128}")
 REQUEST_ID_RE = re.compile(r"[0-9a-f]{64}")
 ENV_KEY_RE = re.compile(r"[A-Z][A-Z0-9_]{2,127}")
 LIFECYCLE_LOCK_NAME = "lifecycle.lock"
+ENCRYPTION_KEY_NAME = "encryption-key.pem"
+ENVELOPE_VERSION = 1
+ENVELOPE_ALGORITHM = "RSA-OAEP-256"
+ENVELOPE_CIPHER = "A256GCM"
+ENVELOPE_KEYS = frozenset({"version", "alg", "enc", "wrapped_key", "iv", "ciphertext"})
+BASE64URL_RE = re.compile(r"[A-Za-z0-9_-]+")
 SECRET_SUFFIXES = (
     "_API_KEY",
     "_TOKEN",
@@ -77,7 +91,10 @@ DANGEROUS_KEYS = {
 }
 DANGEROUS_PREFIXES = ("LD_", "SUDO_", "SYSTEMD_", "XDG_")
 CLIENT_SCRIPT = """(() => {
+  'use strict';
   const TOKEN_HEADER = 'X-Secret-Drop-Token';
+  const MAX_VALUE_BYTES = 65536;
+  const encoder = new TextEncoder();
   const found = /^#token=([A-Za-z0-9_-]{32,128})$/.exec(window.location.hash || '');
   const capability = found ? found[1] : '';
   if (found && window.history && window.history.replaceState) {
@@ -87,36 +104,31 @@ CLIENT_SCRIPT = """(() => {
   const heading = document.getElementById('heading');
   const feedback = document.getElementById('feedback');
   const form = document.getElementById('secret-form');
-  const input = document.getElementById('secret');
-  const label = document.getElementById('secret-label');
+  const fieldsContainer = document.getElementById('fields');
   const submit = document.getElementById('submit');
   const countdown = document.getElementById('countdown');
-  const reveal = document.getElementById('reveal-secret');
-  const slash = document.getElementById('eye-slash');
   let finished = false;
-  let progressLabel = 'Saving\\u2026';
+  let progressLabel = 'Encrypting\\u2026';
+  let fieldSpecs = [];
+  let encryption = null;
 
   const setFeedback = (message) => {
     feedback.textContent = message || '';
     feedback.hidden = !message;
   };
 
+  const clearInputs = () => {
+    fieldsContainer.querySelectorAll('input').forEach((input) => { input.value = ''; });
+  };
+
   const finish = (title, message) => {
     finished = true;
+    clearInputs();
     form.hidden = true;
     countdown.hidden = true;
     heading.textContent = title;
     setFeedback(message);
   };
-
-  reveal.addEventListener('click', () => {
-    const showing = input.type === 'password';
-    input.type = showing ? 'text' : 'password';
-    reveal.setAttribute('aria-label', showing ? 'Hide value' : 'Show value');
-    reveal.setAttribute('title', showing ? 'Hide value' : 'Show value');
-    slash.hidden = !showing;
-    input.focus({preventScroll: true});
-  });
 
   const startCountdown = (seconds) => {
     const deadline = performance.now() + Math.max(0, seconds) * 1000;
@@ -127,7 +139,6 @@ CLIENT_SCRIPT = """(() => {
       const minutes = Math.floor(remaining / 60);
       countdown.textContent = `${minutes}:${String(remaining % 60).padStart(2, '0')}`;
       if (remaining <= 0) {
-        input.value = '';
         finish('Expired', 'This Secret Drop link is no longer valid. Ask for a new one.');
         return;
       }
@@ -137,51 +148,167 @@ CLIENT_SCRIPT = """(() => {
   };
 
   const api = (path, options) => {
-    const settings = Object.assign({cache: 'no-store', credentials: 'omit', redirect: 'error'}, options || {});
+    const settings = Object.assign({cache: 'no-store', credentials: 'same-origin', redirect: 'error'}, options || {});
     settings.headers = Object.assign({}, settings.headers || {}, {[TOKEN_HEADER]: capability});
     return window.fetch(path, settings).then((response) =>
       response.json().catch(() => ({})).then((data) => ({ok: response.ok, data: data || {}}))
     );
   };
 
+  const fromBase64 = (value) => {
+    if (typeof value !== 'string' || !/^[A-Za-z0-9+/]+={0,2}$/.test(value)) throw new Error('bad key');
+    const binary = window.atob(value);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+    return bytes;
+  };
+
+  const toBase64Url = (bytes) => {
+    let binary = '';
+    for (let i = 0; i < bytes.byteLength; i += 1) binary += String.fromCharCode(bytes[i]);
+    return window.btoa(binary).replace(/=/g, '').replace(/\\+/g, '-').replace(/\\//g, '_');
+  };
+
+  const requestId = async () => {
+    const digest = new Uint8Array(await window.crypto.subtle.digest('SHA-256', encoder.encode(capability)));
+    return Array.from(digest, (byte) => byte.toString(16).padStart(2, '0')).join('');
+  };
+
+  const encryptValues = async (values) => {
+    if (!window.crypto || !window.crypto.subtle || !encryption ||
+        encryption.version !== 1 || encryption.alg !== 'RSA-OAEP-256' || encryption.enc !== 'A256GCM') {
+      throw new Error('encryption unavailable');
+    }
+    const plaintext = encoder.encode(JSON.stringify({values}));
+    const totalValueBytes = Object.values(values).reduce((total, value) => total + encoder.encode(value).byteLength, 0);
+    if (totalValueBytes > MAX_VALUE_BYTES) throw new Error('value too large');
+    const publicKey = await window.crypto.subtle.importKey(
+      'spki',
+      fromBase64(encryption.public_key_spki),
+      {name: 'RSA-OAEP', hash: 'SHA-256'},
+      false,
+      ['encrypt']
+    );
+    const aesKey = await window.crypto.subtle.generateKey({name: 'AES-GCM', length: 256}, true, ['encrypt']);
+    const rawKey = new Uint8Array(await window.crypto.subtle.exportKey('raw', aesKey));
+    const iv = window.crypto.getRandomValues(new Uint8Array(12));
+    const aad = encoder.encode(`hermes-secret-drop:v1:${await requestId()}`);
+    try {
+      const ciphertext = new Uint8Array(await window.crypto.subtle.encrypt(
+        {name: 'AES-GCM', iv, additionalData: aad, tagLength: 128}, aesKey, plaintext
+      ));
+      const wrappedKey = new Uint8Array(await window.crypto.subtle.encrypt({name: 'RSA-OAEP'}, publicKey, rawKey));
+      return {
+        version: 1,
+        alg: 'RSA-OAEP-256',
+        enc: 'A256GCM',
+        wrapped_key: toBase64Url(wrappedKey),
+        iv: toBase64Url(iv),
+        ciphertext: toBase64Url(ciphertext)
+      };
+    } finally {
+      plaintext.fill(0);
+      rawKey.fill(0);
+    }
+  };
+
+  const addField = (spec, index) => {
+    const row = document.createElement('div');
+    row.className = 'field-row';
+    const label = document.createElement('label');
+    label.className = fieldSpecs.length > 1 ? 'field-label' : 'sr-only';
+    label.htmlFor = spec.name;
+    label.textContent = spec.label;
+    const holder = document.createElement('div');
+    holder.className = 'field';
+    const input = document.createElement('input');
+    input.id = spec.name;
+    input.name = spec.name;
+    input.type = 'password';
+    input.required = true;
+    input.autocomplete = 'off';
+    input.setAttribute('autocapitalize', 'off');
+    input.setAttribute('spellcheck', 'false');
+    input.setAttribute('aria-label', spec.label);
+    const reveal = document.createElement('button');
+    reveal.className = 'reveal';
+    reveal.type = 'button';
+    reveal.setAttribute('aria-label', 'Show value');
+    reveal.setAttribute('title', 'Show value');
+    reveal.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z"/><circle cx="12" cy="12" r="2.7"/><path data-eye-slash d="m4 4 16 16" hidden/></svg>';
+    reveal.addEventListener('click', () => {
+      const showing = input.type === 'password';
+      input.type = showing ? 'text' : 'password';
+      reveal.setAttribute('aria-label', showing ? 'Hide value' : 'Show value');
+      reveal.setAttribute('title', showing ? 'Hide value' : 'Show value');
+      reveal.querySelector('[data-eye-slash]').hidden = !showing;
+      input.focus({preventScroll: true});
+    });
+    holder.append(input, reveal);
+    row.append(label, holder);
+    fieldsContainer.append(row);
+    if (index === 0) input.focus({preventScroll: true});
+  };
+
   if (!capability) {
     finish('Not found', 'Open the whole Secret Drop link, including the part after the # symbol.');
     return;
   }
+  if (!window.crypto || !window.crypto.subtle) {
+    finish('Encryption unavailable', 'This browser cannot securely encrypt the value. Use a current browser.');
+    return;
+  }
 
-  api('/api/request', {method: 'GET'}).then(({ok, data}) => {
+  api('api/request', {method: 'GET'}).then(({ok, data}) => {
     if (!ok) {
       finish(data.title || 'Not found', data.error || '');
       return;
     }
     const name = data.label || 'Secret';
+    if (!Array.isArray(data.fields) || data.fields.length < 1 || data.fields.length > 16) throw new Error('bad fields');
+    fieldSpecs = data.fields;
+    encryption = data.encryption;
+    if (!encryption || !encryption.public_key_spki) throw new Error('missing encryption');
     heading.textContent = name;
-    label.textContent = name;
-    input.setAttribute('aria-label', name);
     document.title = name + ' \\u00b7 Hermes Secret Drop';
+    fieldSpecs.forEach(addField);
     submit.textContent = data.submit_label || 'Save';
-    progressLabel = data.progress_label || 'Saving\\u2026';
+    progressLabel = data.progress_label || 'Encrypting\\u2026';
     form.hidden = false;
-    input.focus({preventScroll: true});
     startCountdown(Number(data.expires_in_seconds || 0));
-  }).catch(() => finish('Unavailable', 'The Secret Drop service could not be reached.'));
+  }).catch(() => finish('Unavailable', 'A secure Secret Drop session could not be established.'));
 
-  form.addEventListener('submit', (event) => {
+  form.addEventListener('submit', async (event) => {
     event.preventDefault();
     if (finished) return;
-    const value = input.value;
-    if (!value) {
-      setFeedback('Enter the value to save.');
-      return;
+    let values = {};
+    for (const spec of fieldSpecs) {
+      const input = document.getElementById(spec.name);
+      if (!input || !input.value) {
+        setFeedback('Enter every value to save.');
+        return;
+      }
+      values[spec.name] = input.value;
     }
     submit.disabled = true;
     setFeedback(progressLabel);
-    api('/api/secret', {
+    let envelope;
+    try {
+      envelope = await encryptValues(values);
+      values = {};
+      clearInputs();
+    } catch (_error) {
+      values = {};
+      clearInputs();
+      submit.disabled = false;
+      setFeedback('The value could not be encrypted. Nothing was sent.');
+      return;
+    }
+    api('api/secret', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({secret: value})
+      body: JSON.stringify(envelope)
     }).then(({ok, data}) => {
-      input.value = '';
       if (ok) {
         finish(data.result === 'discarded' ? 'Done' : 'Saved', data.note || '');
         return;
@@ -189,14 +316,13 @@ CLIENT_SCRIPT = """(() => {
       submit.disabled = false;
       if (data.retry) {
         setFeedback(data.error || 'That value was not accepted. Try again.');
-        input.focus({preventScroll: true});
+        fieldsContainer.querySelector('input').focus({preventScroll: true});
         return;
       }
       finish(data.title || 'Not saved', data.error || '');
     }).catch(() => {
-      input.value = '';
       submit.disabled = false;
-      setFeedback('The value could not be sent. Try again.');
+      setFeedback('The encrypted value could not be sent. Try again.');
     });
   });
 })();"""
@@ -260,6 +386,126 @@ def fsync_directory(path: Path) -> None:
         os.close(directory_fd)
 
 
+def generate_encryption_private_key(path: Path) -> bool:
+    """Create a local RSA key once without overwriting any existing path."""
+    path = Path(os.path.abspath(os.fspath(path.expanduser())))
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current /= part
+        if current.is_symlink():
+            raise SecretDropError("Secret Drop encryption key path cannot contain a symlink.")
+    ensure_private_dir(path.parent)
+    lock_path = path.parent / f".{path.name}.generate.lock"
+    with exclusive_lock(lock_path):
+        if path.exists() or path.is_symlink():
+            load_encryption_private_key(path)
+            return False
+        private_key = rsa.generate_private_key(public_exponent=65537, key_size=3072)
+        encoded = private_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = -1
+        created = False
+        try:
+            fd = os.open(path, flags, 0o600)
+            created = True
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "wb") as handle:
+                fd = -1
+                handle.write(encoded)
+                handle.flush()
+                os.fsync(handle.fileno())
+            fsync_directory(path.parent)
+        except Exception:
+            if fd >= 0:
+                os.close(fd)
+            if created:
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+            raise
+        load_encryption_private_key(path)
+        return True
+
+
+def load_encryption_private_key(path: Path) -> rsa.RSAPrivateKey:
+    """Load only a private, unlinked, regular RSA key owned by this state tree."""
+    path = Path(os.path.abspath(os.fspath(path.expanduser())))
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current /= part
+        if current.is_symlink():
+            raise SecretDropError(
+                "Secret Drop encryption key path cannot contain a symlink.", HTTPStatus.INTERNAL_SERVER_ERROR
+            )
+    try:
+        file_stat = path.lstat()
+    except OSError as exc:
+        raise SecretDropError(
+            "Secret Drop encryption key is missing or unreadable.", HTTPStatus.INTERNAL_SERVER_ERROR
+        ) from exc
+    if (
+        path.is_symlink()
+        or not stat.S_ISREG(file_stat.st_mode)
+        or file_stat.st_nlink != 1
+        or stat.S_IMODE(file_stat.st_mode) != 0o600
+        or file_stat.st_size < 256
+        or file_stat.st_size > 32 * 1024
+    ):
+        raise SecretDropError(
+            "Secret Drop encryption key is not a private 0600 regular file.", HTTPStatus.INTERNAL_SERVER_ERROR
+        )
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags)
+        with os.fdopen(fd, "rb") as handle:
+            encoded = handle.read(32 * 1024 + 1)
+        private_key = serialization.load_pem_private_key(encoded, password=None)
+    except (OSError, ValueError, TypeError) as exc:
+        raise SecretDropError(
+            "Secret Drop encryption key is invalid.", HTTPStatus.INTERNAL_SERVER_ERROR
+        ) from exc
+    if not isinstance(private_key, rsa.RSAPrivateKey) or private_key.key_size < 2048:
+        raise SecretDropError(
+            "Secret Drop encryption key must be RSA with at least 2048 bits.", HTTPStatus.INTERNAL_SERVER_ERROR
+        )
+    return private_key
+
+
+def encryption_public_spki(config: dict[str, Any]) -> str:
+    private_key = load_encryption_private_key(Path(config["encryption_key_path"]))
+    encoded = private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    return base64.b64encode(encoded).decode("ascii")
+
+
+def public_base_path(config: dict[str, Any]) -> str:
+    return urlsplit(str(config["public_base_url"])).path.rstrip("/")
+
+
+def routed_path(config: dict[str, Any], raw_path: str) -> str | None:
+    """Map the configured public prefix to one of the four fixed routes."""
+    path = urlsplit(raw_path).path
+    prefix = public_base_path(config)
+    if prefix:
+        if path == f"{prefix}/":
+            return "/"
+        if path.startswith(f"{prefix}/"):
+            return path[len(prefix) :]
+        return None
+    return path
+
+
 def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
     ensure_private_dir(path.parent)
     fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
@@ -296,23 +542,57 @@ def load_json(path: Path) -> dict[str, Any]:
 
 def load_config(path: Path) -> dict[str, Any]:
     config = load_json(path)
-    required = ("state_dir", "env_path", "socket_path", "public_base_url")
+    required = ("state_dir", "env_path", "socket_path", "public_base_url", "encryption_key_path")
     if any(not isinstance(config.get(key), str) or not config[key] for key in required):
         raise SecretDropError("Secret Drop is not configured correctly.", HTTPStatus.INTERNAL_SERVER_ERROR)
-    base = config["public_base_url"].rstrip("/")
+    base = config["public_base_url"]
     parsed = urlsplit(base)
     if (
-        parsed.scheme != "https"
+        base.endswith("/")
+        or parsed.scheme != "https"
         or not parsed.hostname
-        or not parsed.hostname.endswith(".ts.net")
         or parsed.username
         or parsed.password
-        or parsed.path
         or parsed.query
         or parsed.fragment
+        or "%" in parsed.path
+        or "//" in parsed.path
+        or any(part in {".", ".."} for part in parsed.path.split("/"))
     ):
-        raise SecretDropError("Secret Drop must use a private Tailscale HTTPS URL.", HTTPStatus.INTERNAL_SERVER_ERROR)
-    config["public_base_url"] = base
+        raise SecretDropError("Secret Drop public_base_url is not a canonical HTTPS URL.", HTTPStatus.INTERNAL_SERVER_ERROR)
+    mode = str(config.get("mode", "tailscale-serve"))
+    if mode == "cloudflare-access":
+        protected_base = config.get("access_protected_public_base_url")
+        if protected_base != base:
+            raise SecretDropError(
+                "Cloudflare Access must protect the exact configured public_base_url.",
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+        http_port = config.get("http_port")
+        if (
+            config.get("http_host") != "127.0.0.1"
+            or type(http_port) is not int
+            or not 1024 <= http_port <= 65535
+        ):
+            raise SecretDropError(
+                "Cloudflare Access mode requires an IPv4-loopback HTTP listener.",
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+        if any(config.get(key) for key in ("https_host", "https_port", "tls_cert", "tls_key")):
+            raise SecretDropError(
+                "Cloudflare Access mode cannot also configure a direct TLS listener.",
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+    else:
+        if not parsed.hostname.endswith(".ts.net") or parsed.path:
+            raise SecretDropError(
+                "Tailnet mode must use a private Tailscale HTTPS URL.", HTTPStatus.INTERNAL_SERVER_ERROR
+            )
+        if config.get("http_host") is not None or config.get("http_port") is not None:
+            raise SecretDropError(
+                "Tailnet mode cannot configure a plaintext HTTP listener.", HTTPStatus.INTERNAL_SERVER_ERROR
+            )
+    load_encryption_private_key(Path(config["encryption_key_path"]))
     configured_max_ttl_minutes(config)
     return config
 
@@ -550,9 +830,15 @@ def tombstone_path(state_dir: Path, request_id: str) -> Path:
 @contextmanager
 def exclusive_lock(path: Path):
     ensure_private_dir(path.parent)
-    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags, 0o600)
     try:
         os.fchmod(fd, 0o600)
+        lock_stat = os.fstat(fd)
+        if not stat.S_ISREG(lock_stat.st_mode) or lock_stat.st_nlink != 1 or lock_stat.st_uid != os.getuid():
+            raise SecretDropError("Secret Drop lock path is not a private regular file.")
         fcntl.flock(fd, fcntl.LOCK_EX)
         yield
     finally:
@@ -625,7 +911,43 @@ def resolve_intake(
     return validate_env_key(key), validate_label(label), validator, None
 
 
-def supersede_pending_requests(config: dict[str, Any], env_key: str) -> int:
+def request_fields(request: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return validated field metadata without exposing it to the browser unchanged."""
+    raw_fields = request.get("fields")
+    if raw_fields is None:
+        env_key = request.get("env_key")
+        validator = request.get("validator")
+        label = request.get("label")
+        if request.get("mode") != "demo":
+            validate_env_key(str(env_key))
+        if validator not in VALIDATORS or not isinstance(label, str):
+            raise SecretDropError("This Secret Drop request is not configured correctly.", HTTPStatus.INTERNAL_SERVER_ERROR)
+        return [{"form_name": "secret", "env_key": env_key, "label": label, "validator": validator}]
+    if not isinstance(raw_fields, list) or not 1 <= len(raw_fields) <= MAX_BUNDLE_FIELDS:
+        raise SecretDropError("This Secret Drop request is not configured correctly.", HTTPStatus.INTERNAL_SERVER_ERROR)
+    fields: list[dict[str, Any]] = []
+    names: set[str] = set()
+    keys: set[str] = set()
+    for index, raw in enumerate(raw_fields):
+        if not isinstance(raw, dict) or set(raw) != {"form_name", "env_key", "label", "validator"}:
+            raise SecretDropError("This Secret Drop request is not configured correctly.", HTTPStatus.INTERNAL_SERVER_ERROR)
+        form_name = str(raw["form_name"])
+        env_key = validate_env_key(str(raw["env_key"]))
+        label = validate_label(str(raw["label"]))
+        validator = str(raw["validator"])
+        if form_name != f"secret_{index}" or form_name in names or env_key in keys or validator not in GENERIC_VALIDATORS:
+            raise SecretDropError("This Secret Drop request is not configured correctly.", HTTPStatus.INTERNAL_SERVER_ERROR)
+        names.add(form_name)
+        keys.add(env_key)
+        fields.append({"form_name": form_name, "env_key": env_key, "label": label, "validator": validator})
+    return fields
+
+
+def request_env_keys(request: dict[str, Any]) -> set[str]:
+    return {str(field["env_key"]) for field in request_fields(request) if field.get("env_key")}
+
+
+def supersede_pending_requests(config: dict[str, Any], env_keys: str | set[str]) -> int:
     """Retire every older pending request that targets the same destination.
 
     Must be called while holding the lifecycle lock. Retirement is durable before
@@ -633,7 +955,9 @@ def supersede_pending_requests(config: dict[str, Any], env_key: str) -> int:
     """
     state_dir = Path(config["state_dir"])
     requests_dir = state_dir / "requests"
-    if not env_key or not requests_dir.is_dir():
+    targets = {env_keys} if isinstance(env_keys, str) else set(env_keys)
+    targets.discard("")
+    if not targets or not requests_dir.is_dir():
         return 0
     superseded = 0
     for path in sorted(requests_dir.glob("*.json")):
@@ -643,7 +967,13 @@ def supersede_pending_requests(config: dict[str, Any], env_key: str) -> int:
             request = load_json(path)
         except SecretDropError:
             continue
-        if request.get("env_key") != env_key or request.get("mode") == "demo":
+        if request.get("mode") == "demo":
+            continue
+        try:
+            overlaps = bool(request_env_keys(request) & targets)
+        except SecretDropError:
+            continue
+        if not overlaps:
             continue
         if effective_request_status(request) != "pending":
             continue
@@ -717,6 +1047,84 @@ def create_request(
         "validator": validator,
         "superseded_requests": superseded,
     }
+
+
+def create_bundle_request(
+    config: dict[str, Any], label: str, fields: list[dict[str, str]], ttl_minutes: int
+) -> dict[str, Any]:
+    bundle_label = validate_label(label)
+    if not 1 <= len(fields) <= MAX_BUNDLE_FIELDS:
+        raise SecretDropError(f"A bundle must contain between 1 and {MAX_BUNDLE_FIELDS} fields.")
+    prepared: list[dict[str, str]] = []
+    keys: set[str] = set()
+    for index, field in enumerate(fields):
+        if not isinstance(field, dict) or set(field) != {"env_key", "label", "validator"}:
+            raise SecretDropError("Each bundled field is invalid.")
+        env_key = validate_env_key(field["env_key"])
+        if env_key in keys:
+            raise SecretDropError("A bundle cannot write the same environment key twice.")
+        validator = field["validator"]
+        if validator not in GENERIC_VALIDATORS:
+            raise SecretDropError("Bundled provider validation requires a dedicated adapter.")
+        keys.add(env_key)
+        prepared.append(
+            {
+                "form_name": f"secret_{index}",
+                "env_key": env_key,
+                "label": validate_label(field["label"]),
+                "validator": validator,
+            }
+        )
+    max_ttl_minutes = configured_max_ttl_minutes(config)
+    if ttl_minutes < 1 or ttl_minutes > max_ttl_minutes:
+        raise SecretDropError(f"Request lifetime must be between 1 and {max_ttl_minutes} minutes.")
+
+    state_dir = Path(config["state_dir"])
+    with lifecycle_lock(state_dir):
+        cleanup_requests(config)
+        ensure_private_dir(state_dir / "requests")
+        created = utc_now()
+        for _ in range(10):
+            capability = secrets.token_urlsafe(32)
+            request_id = capability_digest(capability)
+            path = request_path(state_dir, request_id)
+            if not path.exists() and not tombstone_path(state_dir, request_id).exists():
+                break
+        else:
+            raise SecretDropError("A unique request could not be created.", HTTPStatus.INTERNAL_SERVER_ERROR)
+        superseded = supersede_pending_requests(config, keys)
+        payload = {
+            "version": 3,
+            "request_id": request_id,
+            "label": bundle_label,
+            "fields": prepared,
+            "adapter": None,
+            "mode": "secret",
+            "status": "pending",
+            "created_at": isoformat(created),
+            "expires_at": isoformat(created + timedelta(minutes=ttl_minutes)),
+            "completed_at": None,
+            "result": None,
+        }
+        atomic_write_json(path, payload)
+    return {
+        "request_id": request_id,
+        "request_url": f"{config['public_base_url']}/#token={capability}",
+        "expires_at": payload["expires_at"],
+        "status": "pending",
+        "mode": "secret",
+        "label": bundle_label,
+        "env_keys": sorted(keys),
+        "validators": [field["validator"] for field in prepared],
+        "superseded_requests": superseded,
+    }
+
+
+def parse_bundle_field_arg(raw: str) -> dict[str, str]:
+    key, separator, label = raw.partition("=")
+    if not separator:
+        raise SecretDropError("Each bundled field must use KEY=Friendly label format.")
+    return {"env_key": key, "label": label, "validator": "opaque"}
 
 
 def load_request(config: dict[str, Any], request_id: str) -> tuple[Path, dict[str, Any]]:
@@ -831,7 +1239,20 @@ def get_request_state(config: dict[str, Any], request_id: str) -> tuple[str, dic
 
 
 def atomic_update_env(env_path: Path, key: str, value: str, state_dir: Path) -> None:
-    validate_env_key(key)
+    atomic_update_env_many(env_path, [(key, value)], state_dir)
+
+
+def atomic_update_env_many(env_path: Path, entries: list[tuple[str, str]], state_dir: Path) -> None:
+    if not entries:
+        raise SecretDropError("No environment values were supplied.")
+    prepared: list[tuple[str, str]] = []
+    seen_keys: set[str] = set()
+    for key, value in entries:
+        normalized_key = validate_env_key(key)
+        if normalized_key in seen_keys:
+            raise SecretDropError("The same environment key cannot be updated twice.")
+        seen_keys.add(normalized_key)
+        prepared.append((normalized_key, value))
     env_path = env_path.expanduser()
     env_path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = state_dir / "env-write.lock"
@@ -847,21 +1268,25 @@ def atomic_update_env(env_path: Path, key: str, value: str, state_dir: Path) -> 
         else:
             text = ""
 
-        matcher = re.compile(rf"^\s*(?:export\s+)?{re.escape(key)}\s*=", re.ASCII)
-        replacement = f"{key}={quote_dotenv_value(value)}\n"
+        matchers = {
+            key: re.compile(rf"^\s*(?:export\s+)?{re.escape(key)}\s*=", re.ASCII)
+            for key, _ in prepared
+        }
+        replacements = {key: f"{key}={quote_dotenv_value(value)}\n" for key, value in prepared}
         output: list[str] = []
-        replaced = False
+        replaced: set[str] = set()
         for line in text.splitlines(keepends=True):
-            if matcher.match(line):
-                if not replaced:
-                    output.append(replacement)
-                    replaced = True
+            matched_key = next((key for key, matcher in matchers.items() if matcher.match(line)), None)
+            if matched_key is not None:
+                if matched_key not in replaced:
+                    output.append(replacements[matched_key])
+                    replaced.add(matched_key)
                 continue
             output.append(line)
-        if not replaced:
-            if output and not output[-1].endswith(("\n", "\r")):
-                output[-1] += "\n"
-            output.append(replacement)
+        missing = [(key, replacements[key]) for key, _ in prepared if key not in replaced]
+        if missing and output and not output[-1].endswith(("\n", "\r")):
+            output[-1] += "\n"
+        output.extend(replacement for _, replacement in missing)
         updated = "".join(output)
 
         fd, temp_name = tempfile.mkstemp(prefix=f".{env_path.name}.secret-drop.", dir=env_path.parent)
@@ -882,8 +1307,10 @@ def atomic_update_env(env_path: Path, key: str, value: str, state_dir: Path) -> 
             raise
 
 
-def consume_request(config: dict[str, Any], request_id: str, submitted_value: str) -> dict[str, Any]:
-    """Validate one submission, then deliver it only if the request is still current.
+def consume_request(
+    config: dict[str, Any], request_id: str, submitted_values: str | dict[str, str]
+) -> dict[str, Any]:
+    """Validate a submission, then deliver it only if the request is still current.
 
     Validation runs outside the lifecycle lock because it can reach the network.
     The request is re-checked under the lock afterwards, so a submission that was
@@ -894,18 +1321,36 @@ def consume_request(config: dict[str, Any], request_id: str, submitted_value: st
 
     with lifecycle_lock(state_dir):
         _, request = load_active_request(config, request_id)
-        validator_name = str(request.get("validator", ""))
-        validator_entry = VALIDATORS.get(validator_name)
-        if not validator_entry:
-            raise SecretDropError("This Secret Drop request is not configured correctly.", HTTPStatus.INTERNAL_SERVER_ERROR)
+        fields = request_fields(request)
         ensure_usable(config, request_id, request)
 
-    validator, _ = validator_entry
-    value = validator(submitted_value)
+    if isinstance(submitted_values, str):
+        if len(fields) != 1:
+            raise SecretDropError("Use the Secret Drop page to submit every value.")
+        submitted_map = {fields[0]["form_name"]: submitted_values}
+    elif isinstance(submitted_values, dict):
+        submitted_map = submitted_values
+    else:
+        raise SecretDropError("Use the Secret Drop page to submit every value.")
+    expected_names = {str(field["form_name"]) for field in fields}
+    if set(submitted_map) != expected_names or any(not isinstance(value, str) for value in submitted_map.values()):
+        raise SecretDropError("Use the Secret Drop page to submit every value.")
+    total_bytes = sum(len(value.encode("utf-8")) for value in submitted_map.values())
+    if total_bytes > MAX_SECRET_BYTES:
+        raise SecretDropError("The submitted value is too large.")
+    env_entries: list[tuple[str, str]] = []
+    for field in fields:
+        validator_entry = VALIDATORS.get(str(field["validator"]))
+        if not validator_entry:
+            raise SecretDropError("This Secret Drop request is not configured correctly.", HTTPStatus.INTERNAL_SERVER_ERROR)
+        validator, _ = validator_entry
+        value = validator(submitted_map[str(field["form_name"])])
+        if field.get("env_key"):
+            env_entries.append((str(field["env_key"]), value))
 
     with lifecycle_lock(state_dir):
         path, request = load_active_request(config, request_id)
-        if str(request.get("validator", "")) != validator_name:
+        if request_fields(request) != fields:
             raise SecretDropError("This Secret Drop request changed while it was being verified.", HTTPStatus.CONFLICT)
         ensure_usable(config, request_id, request)
 
@@ -920,7 +1365,10 @@ def consume_request(config: dict[str, Any], request_id: str, submitted_value: st
             return retired
 
         try:
-            atomic_update_env(Path(config["env_path"]), str(request["env_key"]), value, state_dir)
+            if len(env_entries) == 1:
+                atomic_update_env(Path(config["env_path"]), env_entries[0][0], env_entries[0][1], state_dir)
+            else:
+                atomic_update_env_many(Path(config["env_path"]), env_entries, state_dir)
         except Exception:
             raise SecretDropError(
                 "The submitted value could not be saved. Create a new Secret Drop request and try again.",
@@ -964,7 +1412,7 @@ main{{min-height:100svh;display:grid;place-items:center;padding:28px 20px}}
 .brand{{font-size:13px;font-weight:800;letter-spacing:-.01em}}.brand span{{color:var(--muted);font-weight:500}}
 .countdown{{position:absolute;top:0;right:0;color:var(--muted);font-size:12px;font-weight:600;font-variant-numeric:tabular-nums}}
 h1{{margin:52px 0 24px;font-size:clamp(27px,7vw,34px);line-height:1.12;letter-spacing:-.045em;font-weight:720}}
-.field{{position:relative}}input{{width:100%;height:54px;border:1px solid var(--line);border-radius:12px;padding:0 52px 0 15px;background:#fff;color:var(--ink);font:inherit}}input:focus{{outline:2px solid #111;outline-offset:1px;border-color:#111}}input:disabled{{background:var(--soft);color:var(--muted)}}
+.fields{{display:grid;gap:15px}}.field-row{{display:grid;gap:7px}}.field-label{{font-size:13px;font-weight:650;color:#333}}.field{{position:relative}}input{{width:100%;height:54px;border:1px solid var(--line);border-radius:12px;padding:0 52px 0 15px;background:#fff;color:var(--ink);font:inherit}}input:focus{{outline:2px solid #111;outline-offset:1px;border-color:#111}}input:disabled{{background:var(--soft);color:var(--muted)}}
 .reveal{{position:absolute;right:5px;top:5px;width:44px;height:44px;display:grid;place-items:center;border:0;border-radius:9px;background:transparent;color:#666;cursor:pointer}}.reveal:hover{{background:var(--soft);color:#111}}.reveal:focus-visible{{outline:2px solid #111}}.reveal svg{{width:21px;height:21px}}
 .submit{{width:100%;height:52px;margin-top:12px;border:0;border-radius:12px;background:#111;color:#fff;font:inherit;font-weight:700;cursor:pointer}}.submit:hover{{background:#2a2a2a}}.submit:focus-visible{{outline:2px solid #111;outline-offset:2px}}.submit:disabled{{background:#aaa;cursor:not-allowed}}
 .feedback{{margin:-10px 0 16px;color:var(--bad);font-size:13px;line-height:1.45}}
@@ -978,15 +1426,7 @@ h1{{margin:52px 0 24px;font-size:clamp(27px,7vw,34px);line-height:1.12;letter-sp
 <h1 id="heading">Secret Drop</h1>
 <p class="feedback" id="feedback" role="alert" hidden></p>
 <form id="secret-form" autocomplete="off" hidden>
-<label class="sr-only" id="secret-label" for="secret">Value</label>
-<div class="field">
-<input id="secret" name="secret" type="password" required autocomplete="off" autocapitalize="off" spellcheck="false">
-<button id="reveal-secret" class="reveal" type="button" aria-label="Show value" title="Show value">
-<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-<path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z"/><circle cx="12" cy="12" r="2.7"/><path id="eye-slash" d="m4 4 16 16" hidden/>
-</svg>
-</button>
-</div>
+<div class="fields" id="fields"></div>
 <button id="submit" class="submit" type="submit">Save</button>
 </form>
 </section></main><script>{CLIENT_SCRIPT}</script></body>
@@ -1017,18 +1457,90 @@ def request_remaining_seconds(request: dict[str, Any]) -> int:
     return max(0, math.ceil(remaining))
 
 
-def browser_metadata(request: dict[str, Any]) -> dict[str, Any]:
+def browser_metadata(config: dict[str, Any], request: dict[str, Any]) -> dict[str, Any]:
     """Return only what the entry page needs. Never the destination or command."""
-    verifies = request.get("validator") != "opaque"
+    fields = request_fields(request)
+    verifies = any(field["validator"] != "opaque" for field in fields)
+    is_bundle = len(fields) > 1
     return {
         "label": request.get("label"),
         "status": "pending",
         "mode": request.get("mode", "secret"),
         "expires_at": request.get("expires_at"),
         "expires_in_seconds": request_remaining_seconds(request),
-        "submit_label": "Save & verify" if verifies else "Save",
-        "progress_label": "Verifying…" if verifies else "Saving…",
+        "fields": [{"name": field["form_name"], "label": field["label"]} for field in fields],
+        "encryption": {
+            "version": ENVELOPE_VERSION,
+            "alg": ENVELOPE_ALGORITHM,
+            "enc": ENVELOPE_CIPHER,
+            "public_key_spki": encryption_public_spki(config),
+        },
+        "submit_label": "Save all" if is_bundle else ("Save & verify" if verifies else "Save"),
+        "progress_label": "Verifying…" if verifies else "Encrypting…",
     }
+
+
+def decode_base64url(value: Any, *, maximum: int) -> bytes:
+    if not isinstance(value, str) or not value or len(value) > maximum * 2 or not BASE64URL_RE.fullmatch(value):
+        raise ValueError
+    padded = value + "=" * (-len(value) % 4)
+    decoded = base64.b64decode(padded, altchars=b"-_", validate=True)
+    if len(decoded) > maximum or base64.urlsafe_b64encode(decoded).decode("ascii").rstrip("=") != value:
+        raise ValueError
+    return decoded
+
+
+def encryption_aad(request_id: str) -> bytes:
+    if not REQUEST_ID_RE.fullmatch(request_id):
+        raise ValueError
+    return f"hermes-secret-drop:v1:{request_id}".encode("ascii")
+
+
+def decrypt_submission(config: dict[str, Any], request_id: str, payload: Any) -> dict[str, str]:
+    """Authenticate and decrypt one strict hybrid envelope without touching request state."""
+    try:
+        if not isinstance(payload, dict) or set(payload) != ENVELOPE_KEYS:
+            raise ValueError
+        if (
+            payload["version"] != ENVELOPE_VERSION
+            or payload["alg"] != ENVELOPE_ALGORITHM
+            or payload["enc"] != ENVELOPE_CIPHER
+        ):
+            raise ValueError
+        private_key = load_encryption_private_key(Path(config["encryption_key_path"]))
+        wrapped_key = decode_base64url(payload["wrapped_key"], maximum=private_key.key_size // 8)
+        if len(wrapped_key) != private_key.key_size // 8:
+            raise ValueError
+        iv = decode_base64url(payload["iv"], maximum=12)
+        if len(iv) != 12:
+            raise ValueError
+        ciphertext = decode_base64url(payload["ciphertext"], maximum=MAX_PLAINTEXT_BYTES + 16)
+        if len(ciphertext) < 17:
+            raise ValueError
+        aes_key = private_key.decrypt(
+            wrapped_key,
+            padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None),
+        )
+        if len(aes_key) != 32:
+            raise ValueError
+        plaintext = AESGCM(aes_key).decrypt(iv, ciphertext, encryption_aad(request_id))
+        if len(plaintext) > MAX_PLAINTEXT_BYTES:
+            raise ValueError
+        decoded = json.loads(plaintext.decode("utf-8"))
+        if not isinstance(decoded, dict) or set(decoded) != {"values"} or not isinstance(decoded["values"], dict):
+            raise ValueError
+        values = decoded["values"]
+        if not 1 <= len(values) <= MAX_BUNDLE_FIELDS:
+            raise ValueError
+        if any(not isinstance(name, str) or not isinstance(value, str) for name, value in values.items()):
+            raise ValueError
+        if sum(len(value.encode("utf-8")) for value in values.values()) > MAX_SECRET_BYTES:
+            raise ValueError
+        return values
+    except (binascii.Error, InvalidTag, KeyError, TypeError, UnicodeDecodeError, ValueError):
+        raise SecretDropError(
+            "The encrypted submission is invalid or has been altered. Nothing was saved."
+        ) from None
 
 
 class SecretDropHandler(BaseHTTPRequestHandler):
@@ -1080,13 +1592,13 @@ class SecretDropHandler(BaseHTTPRequestHandler):
         return bool(self._origins()) and not self._origin_is_ours()
 
     def do_HEAD(self) -> None:
-        if urlsplit(self.path).path == "/health":
+        if routed_path(self.app_config, self.path) == "/health":
             self._send(HTTPStatus.OK, b"")
         else:
             self._send(HTTPStatus.NOT_FOUND, b"")
 
     def do_GET(self) -> None:
-        path = urlsplit(self.path).path
+        path = routed_path(self.app_config, self.path)
         if path == "/health":
             body = json.dumps({"status": "ok", "version": APP_VERSION}, separators=(",", ":")).encode("utf-8")
             self._send(HTTPStatus.OK, body, "application/json; charset=utf-8")
@@ -1115,7 +1627,12 @@ class SecretDropHandler(BaseHTTPRequestHandler):
             self._send_json(exc.status, {"error": exc.message, "title": "Not found" if exc.status == HTTPStatus.NOT_FOUND else "Unavailable", "retry": False})
             return
         if status_value == "pending" and request is not None:
-            self._send_json(HTTPStatus.OK, browser_metadata(request))
+            try:
+                metadata = browser_metadata(self.app_config, request)
+            except SecretDropError as exc:
+                self._send_json(exc.status, {"error": exc.message, "title": "Unavailable", "retry": False})
+                return
+            self._send_json(HTTPStatus.OK, metadata)
         elif status_value == "expired":
             self._send_json(HTTPStatus.GONE, {"error": "This Secret Drop link has expired.", "title": "Expired", "retry": False})
         elif status_value == "superseded":
@@ -1138,7 +1655,7 @@ class SecretDropHandler(BaseHTTPRequestHandler):
         self._send_json(status_code, {"error": message, "title": title, "retry": False})
 
     def do_POST(self) -> None:
-        if urlsplit(self.path).path != "/api/secret":
+        if routed_path(self.app_config, self.path) != "/api/secret":
             self._send(HTTPStatus.NOT_FOUND, render_notice("Not found"))
             return
         try:
@@ -1176,16 +1693,17 @@ class SecretDropHandler(BaseHTTPRequestHandler):
         raw_body = self.rfile.read(content_length)
         try:
             payload = json.loads(raw_body.decode("utf-8"))
-            if not isinstance(payload, dict) or set(payload) != {"secret"} or not isinstance(payload["secret"], str):
-                raise ValueError
-            submitted_value = payload["secret"]
         except (UnicodeDecodeError, ValueError):
-            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "Use the Secret Drop page to submit one value.", "title": "Not saved", "retry": False})
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"error": "The encrypted submission is invalid. Nothing was saved.", "title": "Try again", "retry": True},
+            )
             return
 
         request_id = capability_digest(capability)
         try:
-            result = consume_request(self.app_config, request_id, submitted_value)
+            submitted_values = decrypt_submission(self.app_config, request_id, payload)
+            result = consume_request(self.app_config, request_id, submitted_values)
         except SecretDropError as exc:
             retry = False
             try:
@@ -1268,12 +1786,28 @@ class SecretDropTLSServer(ThreadingHTTPServer):
         self.socket = context.wrap_socket(self.socket, server_side=True)
 
 
-def probe_unix_health(socket_path: Path) -> dict[str, Any]:
+class SecretDropLoopbackServer(ThreadingHTTPServer):
+    """Plain HTTP origin allowed only behind an authenticated local Cloudflare tunnel."""
+
+    allow_reuse_address = True
+    daemon_threads = True
+
+    def __init__(self, host: str, port: int, app_config: dict[str, Any]):
+        if host != "127.0.0.1":
+            raise SecretDropError(
+                "Cloudflare Access HTTP must bind only to 127.0.0.1.", HTTPStatus.INTERNAL_SERVER_ERROR
+            )
+        self.app_config = app_config
+        super().__init__((host, port), SecretDropHandler)
+
+
+def probe_unix_health(socket_path: Path, health_path: str = "/health") -> dict[str, Any]:
     client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     client.settimeout(5)
     try:
         client.connect(str(socket_path))
-        client.sendall(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        request = f"GET {health_path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n".encode("ascii")
+        client.sendall(request)
         chunks: list[bytes] = []
         while True:
             chunk = client.recv(4096)
@@ -1371,6 +1905,11 @@ def build_parser() -> argparse.ArgumentParser:
     create.add_argument("--validator", choices=GENERIC_VALIDATORS, default=None)
     create.add_argument("--ttl-minutes", type=int, default=DEFAULT_TTL_MINUTES)
 
+    bundle = subparsers.add_parser("create-bundle", help="Create one atomic multi-field request")
+    bundle.add_argument("--label", required=True)
+    bundle.add_argument("--field", action="append", required=True, metavar="KEY=Friendly label")
+    bundle.add_argument("--ttl-minutes", type=int, default=DEFAULT_TTL_MINUTES)
+
     demo = subparsers.add_parser("demo", help="Create a disposable demo that never stores the submitted value")
     demo.add_argument("--label", default="Example API key")
     demo.add_argument("--ttl-minutes", type=int, default=DEFAULT_TTL_MINUTES)
@@ -1381,6 +1920,8 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("health", help="Probe the local Unix service")
     cleanup = subparsers.add_parser("cleanup", help="Retire expired requests and old tombstones")
     cleanup.add_argument("--tombstone-keep-hours", type=int, default=TOMBSTONE_KEEP_HOURS)
+    keygen = subparsers.add_parser("generate-key", help="Create the local application-encryption RSA key")
+    keygen.add_argument("--path", type=Path, required=True)
     subparsers.add_parser("serve", help="Run the Secret Drop web service")
     return parser
 
@@ -1390,6 +1931,10 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
     try:
+        if args.command == "generate-key":
+            created = generate_encryption_private_key(args.path)
+            print(json.dumps({"status": "created" if created else "exists", "path": str(args.path)}, sort_keys=True))
+            return
         config = load_config(args.config.expanduser())
         if args.command == "create":
             result = create_request(
@@ -1400,6 +1945,9 @@ def main() -> None:
                 args.ttl_minutes,
                 adapter=args.adapter,
             )
+        elif args.command == "create-bundle":
+            fields = [parse_bundle_field_arg(raw) for raw in args.field]
+            result = create_bundle_request(config, args.label, fields, args.ttl_minutes)
         elif args.command == "demo":
             result = create_request(
                 config,
@@ -1414,7 +1962,8 @@ def main() -> None:
             result = request_public_status(request) if request is not None else load_tombstone(config, args.request_id)
             result["status"] = status_value
         elif args.command == "health":
-            result = probe_unix_health(Path(config["socket_path"]))
+            prefix = public_base_path(config)
+            result = probe_unix_health(Path(config["socket_path"]), f"{prefix}/health" if prefix else "/health")
         elif args.command == "cleanup":
             result = {"status": "ok", **cleanup_requests(config, args.tombstone_keep_hours)}
         elif args.command == "serve":
@@ -1429,13 +1978,22 @@ def main() -> None:
             cleanup_thread.start()
             try:
                 unix_server = SecretDropUnixServer(Path(config["socket_path"]), config)
+                http_host = config.get("http_host")
+                http_port = config.get("http_port")
                 https_host = config.get("https_host")
                 https_port = config.get("https_port")
                 tls_cert = config.get("tls_cert")
                 tls_key = config.get("tls_key")
-                if all((https_host, https_port, tls_cert, tls_key)):
+                network_server: ThreadingHTTPServer | None = None
+                if http_host is not None and http_port is not None:
                     try:
-                        tls_server = SecretDropTLSServer(
+                        network_server = SecretDropLoopbackServer(str(http_host), int(http_port), config)
+                    except Exception:
+                        unix_server.server_close()
+                        raise
+                elif all((https_host, https_port, tls_cert, tls_key)):
+                    try:
+                        network_server = SecretDropTLSServer(
                             str(https_host),
                             int(str(https_port)),
                             Path(str(tls_cert)),
@@ -1445,6 +2003,7 @@ def main() -> None:
                     except Exception:
                         unix_server.server_close()
                         raise
+                if network_server is not None:
                     unix_thread = threading.Thread(
                         target=unix_server.serve_forever,
                         kwargs={"poll_interval": 0.5},
@@ -1452,9 +2011,9 @@ def main() -> None:
                     )
                     unix_thread.start()
                     try:
-                        tls_server.serve_forever(poll_interval=0.5)
+                        network_server.serve_forever(poll_interval=0.5)
                     finally:
-                        tls_server.server_close()
+                        network_server.server_close()
                         unix_server.shutdown()
                         unix_server.server_close()
                         unix_thread.join(timeout=5)
