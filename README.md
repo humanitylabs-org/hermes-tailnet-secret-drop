@@ -16,7 +16,7 @@ This protects the chat boundary and, in normal Cloudflare operation, keeps the e
 
 - Linux with systemd user services
 - Python 3.10 or newer
-- `cryptography>=41,<51` installed in the Python environment that runs setup and the service
+- The dependencies in `requirements.txt`, including `cryptography>=41,<51` and the version parser used to enforce that interval
 - Hermes Agent and Git
 - One private delivery path:
   - recommended: Cloudflare Access plus Tunnel to IPv4 loopback; or

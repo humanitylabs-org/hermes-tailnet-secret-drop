@@ -187,10 +187,12 @@ def require_cryptography() -> None:
             sys.executable,
             "-c",
             (
-                "import re,sys; from importlib.metadata import version; "
+                "import sys; from importlib.metadata import version; "
                 "from cryptography.hazmat.primitives.ciphers.aead import AESGCM; "
-                "m=re.match(r'^(\\d+)(?:\\.|$)',version('cryptography')); "
-                "sys.exit(0 if m and 41 <= int(m.group(1)) < 51 else 1)"
+                "from packaging.specifiers import SpecifierSet; "
+                "from packaging.version import Version; "
+                "installed=Version(version('cryptography')); "
+                "sys.exit(0 if SpecifierSet('>=41,<51').contains(installed, prereleases=False) else 1)"
             ),
         ],
         check=False,
@@ -223,6 +225,14 @@ def remove_previous_tailscale_serve(previous_config: dict[str, Any]) -> bool:
         try:
             payload = json.loads(result.stdout)
             handlers = ((payload.get("Web") or {}).get(f"{dns_name}:{port}") or {}).get("Handlers") or {}
+            if not isinstance(handlers, dict):
+                raise AttributeError
+            if not handlers:
+                return None
+            if set(handlers) != {"/"}:
+                raise InstallError(
+                    "The previous Tailnet listener contains additional routes; refusing to remove the shared listener."
+                )
             route = handlers.get("/") or {}
             return route.get("Proxy") if isinstance(route, dict) else None
         except (AttributeError, json.JSONDecodeError) as exc:

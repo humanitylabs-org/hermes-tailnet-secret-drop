@@ -28,7 +28,8 @@ class InstallerTests(unittest.TestCase):
             installer.require_cryptography()
         command = run_mock.call_args.args[0]
         self.assertIn("version('cryptography')", command[2])
-        self.assertIn("41 <= int(m.group(1)) < 51", command[2])
+        self.assertIn("SpecifierSet('>=41,<51')", command[2])
+        self.assertIn("prereleases=False", command[2])
 
         failed = subprocess.CompletedProcess([sys.executable], 1, "", "")
         with patch.object(installer, "run", return_value=failed), self.assertRaises(installer.InstallError):
@@ -90,6 +91,36 @@ class InstallerTests(unittest.TestCase):
             with patch.object(installer, "run", return_value=reassigned):
                 with self.assertRaises(installer.InstallError):
                     installer.remove_previous_tailscale_serve(previous)
+
+    def test_cloudflare_migration_refuses_to_remove_a_listener_with_additional_routes(self):
+        previous = {
+            "mode": "tailscale-serve",
+            "public_base_url": "https://node.example.ts.net:8805",
+            "https_port": 8805,
+            "socket_path": "/private/secret-drop.sock",
+        }
+        shared = subprocess.CompletedProcess(
+            ["tailscale"],
+            0,
+            json.dumps(
+                {
+                    "Web": {
+                        "node.example.ts.net:8805": {
+                            "Handlers": {
+                                "/": {"Proxy": "unix:/private/secret-drop.sock"},
+                                "/another-app": {"Proxy": "http://127.0.0.1:9999"},
+                            }
+                        }
+                    }
+                }
+            ),
+            "",
+        )
+        with patch.object(installer.shutil, "which", return_value="/usr/bin/tailscale"):
+            with patch.object(installer, "run", return_value=shared) as run_mock:
+                with self.assertRaises(installer.InstallError):
+                    installer.remove_previous_tailscale_serve(previous)
+        self.assertEqual(run_mock.call_count, 1)
 
     def test_install_restarts_an_already_running_service(self):
         completed = subprocess.CompletedProcess(["systemctl"], 0, "", "")
