@@ -28,6 +28,7 @@ CERT_SERVICE_NAME = f"{APP_NAME}-cert.service"
 CERT_TIMER_NAME = f"{APP_NAME}-cert.timer"
 DEFAULT_HTTPS_PORT = 8805
 DEFAULT_HTTP_PORT = 8805
+PENDING_TAILSCALE_CLEANUP = "pending_tailscale_serve_cleanup"
 
 
 class InstallError(RuntimeError):
@@ -204,6 +205,28 @@ def require_cryptography() -> None:
         )
 
 
+def tailscale_cleanup_record(previous_config: dict[str, Any]) -> dict[str, Any]:
+    """Return the minimal predecessor ownership record, including a pending retry."""
+    source: Any
+    if previous_config.get("mode") == "tailscale-serve":
+        source = previous_config
+    elif PENDING_TAILSCALE_CLEANUP in previous_config:
+        source = previous_config.get(PENDING_TAILSCALE_CLEANUP)
+        if not isinstance(source, dict):
+            raise InstallError("The pending Tailscale Serve cleanup record is invalid; refusing migration.")
+    else:
+        return {}
+    record = {
+        "mode": source.get("mode"),
+        "public_base_url": source.get("public_base_url"),
+        "https_port": source.get("https_port"),
+        "socket_path": source.get("socket_path"),
+    }
+    if record["mode"] != "tailscale-serve":
+        raise InstallError("The pending Tailscale Serve cleanup record is invalid; refusing migration.")
+    return record
+
+
 def remove_previous_tailscale_serve(previous_config: dict[str, Any]) -> bool:
     """Remove only the Tailnet listener previously owned by this installer."""
     if previous_config.get("mode") != "tailscale-serve":
@@ -251,6 +274,19 @@ def remove_previous_tailscale_serve(previous_config: dict[str, Any]) -> bool:
     if result.returncode != 0 or owned_proxy() is not None:
         raise InstallError("The previous Secret Drop Tailscale Serve route could not be removed safely.")
     return True
+
+
+def finish_tailscale_cleanup(config_path: Path, cleanup_record: dict[str, Any]) -> bool:
+    """Finish exact predecessor cleanup and clear its durable marker only afterward."""
+    if not cleanup_record:
+        return False
+    removed = remove_previous_tailscale_serve(cleanup_record)
+    current = load_json_if_present(config_path)
+    if current.get(PENDING_TAILSCALE_CLEANUP) != cleanup_record:
+        raise InstallError("The pending Tailscale Serve cleanup record changed unexpectedly.")
+    del current[PENDING_TAILSCALE_CLEANUP]
+    atomic_json(config_path, current)
+    return removed
 
 
 def validate_access_base_url(raw: str) -> str:
@@ -536,7 +572,8 @@ def install(args: argparse.Namespace) -> dict[str, Any]:
     for path in (state_dir, install_dir, skill_dir, env_path, bin_dir, user_unit_dir):
         reject_symlink_components(path)
     previous_config = load_json_if_present(config_path)
-    if access_mode and args.no_start and previous_config.get("mode") == "tailscale-serve":
+    cleanup_record = tailscale_cleanup_record(previous_config) if access_mode else {}
+    if access_mode and args.no_start and cleanup_record:
         raise InstallError(
             "Cloudflare migration cannot use --no-start while the previous Tailscale Serve route is active. "
             "Rerun without --no-start so the new loopback service is verified before that exact route is removed."
@@ -569,6 +606,8 @@ def install(args: argparse.Namespace) -> dict[str, Any]:
                 "mode": "cloudflare-access",
             }
         )
+        if cleanup_record:
+            base_config[PENDING_TAILSCALE_CLEANUP] = cleanup_record
     else:
         base_config.update({"https_port": https_port, "mode": "staged"})
     atomic_json(config_path, base_config)
@@ -593,7 +632,7 @@ def install(args: argparse.Namespace) -> dict[str, Any]:
     if access_mode:
         run([systemctl_bin, "--user", "disable", "--now", CERT_TIMER_NAME], check=False)
         probe_loopback(public_base_url, args.http_port)
-        remove_previous_tailscale_serve(previous_config)
+        finish_tailscale_cleanup(config_path, cleanup_record)
         return {
             "status": "installed",
             "command": str(wrapper),

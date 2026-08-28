@@ -77,6 +77,55 @@ class InstallerTests(unittest.TestCase):
             with self.assertRaisesRegex(installer.InstallError, "Tailscale CLI is unavailable"):
                 installer.remove_previous_tailscale_serve(previous)
 
+    def test_cloudflare_migration_retries_persisted_cleanup_until_verified(self):
+        previous = {
+            "mode": "tailscale-serve",
+            "public_base_url": "https://node.example.ts.net:8805",
+            "https_port": 8805,
+            "socket_path": "/private/secret-drop.sock",
+            "unrelated": "not-persisted",
+        }
+        cleanup = installer.tailscale_cleanup_record(previous)
+        self.assertEqual(
+            cleanup,
+            {
+                "mode": "tailscale-serve",
+                "public_base_url": "https://node.example.ts.net:8805",
+                "https_port": 8805,
+                "socket_path": "/private/secret-drop.sock",
+            },
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            config_path = Path(temp) / "config.json"
+            installer.atomic_json(
+                config_path,
+                {
+                    "mode": "cloudflare-access",
+                    installer.PENDING_TAILSCALE_CLEANUP: cleanup,
+                },
+            )
+            with patch.object(installer.shutil, "which", return_value=None):
+                with self.assertRaises(installer.InstallError):
+                    installer.finish_tailscale_cleanup(config_path, cleanup)
+            failed_config = json.loads(config_path.read_text(encoding="utf-8"))
+            self.assertEqual(failed_config[installer.PENDING_TAILSCALE_CLEANUP], cleanup)
+            retry_cleanup = installer.tailscale_cleanup_record(failed_config)
+            with patch.object(installer, "remove_previous_tailscale_serve", return_value=True) as remove_mock:
+                self.assertTrue(installer.finish_tailscale_cleanup(config_path, retry_cleanup))
+            remove_mock.assert_called_once_with(cleanup)
+            completed_config = json.loads(config_path.read_text(encoding="utf-8"))
+            self.assertNotIn(installer.PENDING_TAILSCALE_CLEANUP, completed_config)
+
+    def test_cloudflare_migration_rejects_malformed_pending_cleanup_record(self):
+        for invalid in ("invalid", {"mode": "cloudflare-access"}):
+            with self.subTest(invalid=invalid), self.assertRaises(installer.InstallError):
+                installer.tailscale_cleanup_record(
+                    {
+                        "mode": "cloudflare-access",
+                        installer.PENDING_TAILSCALE_CLEANUP: invalid,
+                    }
+                )
+
     def test_cloudflare_migration_refuses_to_remove_a_reassigned_listener(self):
         previous = {
             "mode": "tailscale-serve",
