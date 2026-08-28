@@ -3,6 +3,13 @@ set -euo pipefail
 
 FAIL=0
 FIXES=()
+MODE="tailnet"
+if [[ "${1:-}" == "--mode" && "${2:-}" == "cloudflare-access" ]]; then
+  MODE="cloudflare-access"
+elif [[ "${1:-}" == "--mode" && "${2:-}" != "tailnet" ]]; then
+  printf 'Usage: %s [--mode tailnet|cloudflare-access]\n' "$0" >&2
+  exit 2
+fi
 
 ok() { printf '[ok] %s\n' "$1"; }
 fail() {
@@ -33,6 +40,20 @@ else
   fail "python3" "Install Python 3.10 or newer, then rerun this check."
 fi
 
+if python3 - <<'PY' >/dev/null 2>&1
+import re
+from importlib.metadata import version
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+match = re.match(r"^(\d+)(?:\.|$)", version("cryptography"))
+raise SystemExit(0 if match and 41 <= int(match.group(1)) < 51 else 1)
+PY
+then
+  ok "Python cryptography package"
+else
+  fail "Python cryptography>=41,<51" "Install the repository's declared Python dependency into the environment used for setup, then rerun this check."
+fi
+
 if command -v git >/dev/null 2>&1; then
   ok "git"
 else
@@ -55,7 +76,9 @@ else
   fail "Hermes Agent" "Install Hermes from https://hermes-agent.nousresearch.com/docs, then run: hermes setup"
 fi
 
-if command -v tailscale >/dev/null 2>&1; then
+if [[ "$MODE" == "cloudflare-access" ]]; then
+  ok "Cloudflare Access mode selected (Tailscale not required)"
+elif command -v tailscale >/dev/null 2>&1; then
   ok "Tailscale CLI"
   if tailscale status --json | python3 -c '
 import json, re, sys

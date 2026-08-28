@@ -4,7 +4,14 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-./scripts/prereq-check.sh
+prereq_mode="tailnet"
+for arg in "$@"; do
+  if [[ "$arg" == "--access-protected-public-base-url" || "$arg" == --access-protected-public-base-url=* ]]; then
+    prereq_mode="cloudflare-access"
+    break
+  fi
+done
+./scripts/prereq-check.sh --mode "$prereq_mode"
 
 install_json="$(python3 scripts/install.py "$@")"
 command_path="$(printf '%s' "$install_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["command"])')"

@@ -9,6 +9,7 @@ import os
 import re
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -16,6 +17,7 @@ import time
 from pathlib import Path
 from typing import Any
 from urllib.error import URLError
+from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 APP_NAME = "hermes-tailnet-secret-drop"
@@ -25,6 +27,7 @@ SERVICE_NAME = f"{APP_NAME}.service"
 CERT_SERVICE_NAME = f"{APP_NAME}-cert.service"
 CERT_TIMER_NAME = f"{APP_NAME}-cert.timer"
 DEFAULT_HTTPS_PORT = 8805
+DEFAULT_HTTP_PORT = 8805
 
 
 class InstallError(RuntimeError):
@@ -178,6 +181,99 @@ def tailscale_identity() -> tuple[str, str]:
     return dns_name, ipv4
 
 
+def require_cryptography() -> None:
+    result = run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import re,sys; from importlib.metadata import version; "
+                "from cryptography.hazmat.primitives.ciphers.aead import AESGCM; "
+                "m=re.match(r'^(\\d+)(?:\\.|$)',version('cryptography')); "
+                "sys.exit(0 if m and 41 <= int(m.group(1)) < 51 else 1)"
+            ),
+        ],
+        check=False,
+    )
+    if result.returncode != 0:
+        raise InstallError(
+            "Python package cryptography>=41,<51 is required. Install this repository's declared dependency "
+            "into the Python environment used to run setup, then retry."
+        )
+
+
+def remove_previous_tailscale_serve(previous_config: dict[str, Any]) -> bool:
+    """Remove only the Tailnet listener previously owned by this installer."""
+    if previous_config.get("mode") != "tailscale-serve":
+        return False
+    parsed = urlsplit(str(previous_config.get("public_base_url") or ""))
+    port = previous_config.get("https_port") or parsed.port
+    socket_path = str(previous_config.get("socket_path") or "")
+    dns_name = str(parsed.hostname or "")
+    if type(port) is not int or port < 1024 or port > 65535 or not dns_name.endswith(".ts.net") or not socket_path:
+        raise InstallError("The previous Tailscale Serve ownership record is invalid; refusing broad cleanup.")
+    tailscale_bin = shutil.which("tailscale")
+    if not tailscale_bin:
+        return False
+
+    def owned_proxy() -> str | None:
+        result = run([tailscale_bin, "serve", "status", "--json"], check=False)
+        if result.returncode != 0:
+            raise InstallError("Could not inspect the previous Tailscale Serve route safely.")
+        try:
+            payload = json.loads(result.stdout)
+            handlers = ((payload.get("Web") or {}).get(f"{dns_name}:{port}") or {}).get("Handlers") or {}
+            route = handlers.get("/") or {}
+            return route.get("Proxy") if isinstance(route, dict) else None
+        except (AttributeError, json.JSONDecodeError) as exc:
+            raise InstallError("The previous Tailscale Serve status was not valid JSON.") from exc
+
+    expected_proxy = f"unix:{socket_path}"
+    current_proxy = owned_proxy()
+    if current_proxy is None:
+        return False
+    if current_proxy != expected_proxy:
+        raise InstallError("The previous Tailnet listener is no longer owned by Secret Drop; refusing to remove it.")
+    result = run([tailscale_bin, "serve", "--yes", f"--https={port}", "off"], check=False)
+    if result.returncode != 0 or owned_proxy() is not None:
+        raise InstallError("The previous Secret Drop Tailscale Serve route could not be removed safely.")
+    return True
+
+
+def validate_access_base_url(raw: str) -> str:
+    parsed = urlsplit(raw)
+    if (
+        raw != raw.strip()
+        or raw.endswith("/")
+        or parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+        or "%" in parsed.path
+        or "//" in parsed.path
+        or any(part in {".", ".."} for part in parsed.path.split("/"))
+    ):
+        raise InstallError("--access-protected-public-base-url must be one canonical HTTPS URL without a trailing slash.")
+    return raw
+
+
+def ensure_loopback_port(port: int, config_path: Path) -> None:
+    if port < 1024 or port > 65535:
+        raise InstallError("The loopback HTTP port must be between 1024 and 65535.")
+    existing = load_json_if_present(config_path)
+    if existing.get("mode") == "cloudflare-access" and existing.get("http_port") == port:
+        return
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        probe.bind(("127.0.0.1", port))
+    except OSError as exc:
+        raise InstallError(f"Loopback HTTP port {port} is already in use.") from exc
+    finally:
+        probe.close()
+
+
 def hermes_paths() -> tuple[Path, Path]:
     override = os.environ.get("HERMES_HOME")
     if override:
@@ -230,7 +326,7 @@ def write_service(unit_path: Path, python: str, script: Path, config: Path, env_
             raise InstallError("Unsafe newline in service path.")
     unit = f"""{MANAGED_FILE_MARKER}
 [Unit]
-Description=Hermes Tailnet Secret Drop
+Description=Hermes Secret Drop
 After=network-online.target
 Wants=network-online.target
 
@@ -363,6 +459,24 @@ def probe_tailnet(base_url: str) -> None:
     raise InstallError(f"Tailnet health endpoint was not reachable ({error_name}).")
 
 
+def probe_loopback(base_url: str, port: int) -> None:
+    path = urlsplit(base_url).path.rstrip("/")
+    request_url = f"http://127.0.0.1:{port}{path}/health"
+    last_error: Exception | None = None
+    for _ in range(30):
+        try:
+            request = Request(request_url, headers={"User-Agent": "Hermes-Secret-Drop-Installer/1.3"})
+            with urlopen(request, timeout=5) as response:
+                body = response.read(4096)
+                if response.status == 200 and b'"status":"ok"' in body:
+                    return
+        except (URLError, TimeoutError, OSError) as exc:
+            last_error = exc
+        time.sleep(0.25)
+    error_name = type(last_error).__name__ if last_error else "unexpected response"
+    raise InstallError(f"Loopback Cloudflare origin health endpoint was not reachable ({error_name}).")
+
+
 def restart_service(systemctl_bin: str) -> None:
     run([systemctl_bin, "--user", "daemon-reload"])
     run([systemctl_bin, "--user", "enable", SERVICE_NAME])
@@ -378,7 +492,15 @@ def install(args: argparse.Namespace) -> dict[str, Any]:
     if not source_script.is_file() or not source_skill.is_file():
         raise InstallError("Run the installer from a complete Hermes Tailnet Secret Drop checkout.")
 
-    dns_name, tailscale_ipv4 = tailscale_identity()
+    require_cryptography()
+    access_mode = bool(args.access_protected_public_base_url)
+    public_base_url = ""
+    if access_mode:
+        public_base_url = validate_access_base_url(args.access_protected_public_base_url)
+        dns_name = ""
+        tailscale_ipv4 = ""
+    else:
+        dns_name, tailscale_ipv4 = tailscale_identity()
     hermes_home, env_path = hermes_paths()
     state_dir = lexical_absolute(args.state_dir)
     install_dir = lexical_absolute(args.install_dir)
@@ -388,32 +510,54 @@ def install(args: argparse.Namespace) -> dict[str, Any]:
     config_path = state_dir / "config.json"
     socket_path = state_dir / "secret-drop.sock"
     cert_path = state_dir / "tls.crt"
-    key_path = state_dir / "tls.key"
+    tls_key_path = state_dir / "tls.key"
+    encryption_key_path = state_dir / "encryption-key.pem"
     installed_script = install_dir / "secret_drop.py"
     wrapper = bin_dir / "hermes-secret-drop"
     https_port = args.https_port
 
-    ensure_safe_port(https_port, config_path)
+    if access_mode:
+        ensure_loopback_port(args.http_port, config_path)
+    else:
+        ensure_safe_port(https_port, config_path)
     for path in (state_dir, install_dir, skill_dir, env_path, bin_dir, user_unit_dir):
         reject_symlink_components(path)
+    previous_config = load_json_if_present(config_path)
+    if access_mode and args.no_start and previous_config.get("mode") == "tailscale-serve":
+        raise InstallError(
+            "Cloudflare migration cannot use --no-start while the previous Tailscale Serve route is active. "
+            "Rerun without --no-start so the new loopback service is verified before that exact route is removed."
+        )
     for directory in (state_dir, install_dir, skill_dir):
         prepare_managed_directory(directory)
     prepare_env_file(env_path)
+    run([sys.executable, str(source_script), "generate-key", "--path", str(encryption_key_path)])
     copy_into_managed_directory(source_script, installed_script, 0o700)
     copy_into_managed_directory(source_skill, skill_dir / "SKILL.md", 0o600)
     write_wrapper(wrapper, sys.executable, installed_script, config_path)
 
-    public_base_url = f"https://{dns_name}:{https_port}"
+    if not access_mode:
+        public_base_url = f"https://{dns_name}:{https_port}"
     base_config: dict[str, Any] = {
         "app": APP_NAME,
+        "encryption_key_path": str(encryption_key_path),
         "env_path": str(env_path),
-        "https_port": https_port,
-        "mode": "staged",
         "public_base_url": public_base_url,
         "socket_path": str(socket_path),
         "state_dir": str(state_dir),
-        "version": "1",
+        "version": "2",
     }
+    if access_mode:
+        base_config.update(
+            {
+                "access_protected_public_base_url": public_base_url,
+                "http_host": "127.0.0.1",
+                "http_port": args.http_port,
+                "mode": "cloudflare-access",
+            }
+        )
+    else:
+        base_config.update({"https_port": https_port, "mode": "staged"})
     atomic_json(config_path, base_config)
     unit_path = user_unit_dir / SERVICE_NAME
     write_service(unit_path, sys.executable, installed_script, config_path, env_path, state_dir)
@@ -422,16 +566,35 @@ def install(args: argparse.Namespace) -> dict[str, Any]:
         return {
             "status": "staged",
             "command": str(wrapper),
+            "mode": base_config["mode"],
             "public_base_url": public_base_url,
             "service": SERVICE_NAME,
         }
 
     systemctl_bin = shutil.which("systemctl")
-    tailscale_bin = shutil.which("tailscale")
-    if not systemctl_bin or not tailscale_bin:
-        raise InstallError("systemd user services and the Tailscale CLI are required on this Linux package.")
+    if not systemctl_bin:
+        raise InstallError("systemd user services are required on this Linux package.")
     restart_service(systemctl_bin)
     probe_local(wrapper)
+
+    if access_mode:
+        run([systemctl_bin, "--user", "disable", "--now", CERT_TIMER_NAME], check=False)
+        probe_loopback(public_base_url, args.http_port)
+        remove_previous_tailscale_serve(previous_config)
+        return {
+            "status": "installed",
+            "command": str(wrapper),
+            "demo_command": f"{wrapper} demo",
+            "mode": "cloudflare-access",
+            "public_base_url": public_base_url,
+            "loopback_origin": f"http://127.0.0.1:{args.http_port}",
+            "service": SERVICE_NAME,
+            "skill": str(skill_dir / "SKILL.md"),
+        }
+
+    tailscale_bin = shutil.which("tailscale")
+    if not tailscale_bin:
+        raise InstallError("The Tailscale CLI is required for Tailnet mode.")
 
     mode = "tailscale-serve"
     serve_result = run(
@@ -449,14 +612,14 @@ def install(args: argparse.Namespace) -> dict[str, Any]:
         run([systemctl_bin, "--user", "disable", "--now", CERT_TIMER_NAME], check=False)
     else:
         mode = "rootless-tailnet-https"
-        issue_certificate(tailscale_bin, dns_name, cert_path, key_path)
+        issue_certificate(tailscale_bin, dns_name, cert_path, tls_key_path)
         tls_config = dict(base_config)
         tls_config.update(
             {
                 "mode": mode,
                 "https_host": tailscale_ipv4,
                 "tls_cert": str(cert_path),
-                "tls_key": str(key_path),
+                "tls_key": str(tls_key_path),
             }
         )
         atomic_json(config_path, tls_config)
@@ -466,7 +629,7 @@ def install(args: argparse.Namespace) -> dict[str, Any]:
             systemctl_bin,
             dns_name,
             cert_path,
-            key_path,
+            tls_key_path,
         )
         run([systemctl_bin, "--user", "daemon-reload"])
         run([systemctl_bin, "--user", "enable", "--now", CERT_TIMER_NAME])
@@ -493,6 +656,12 @@ def build_parser() -> argparse.ArgumentParser:
     data_home = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share"))
     parser = argparse.ArgumentParser(description="Install Hermes Tailnet Secret Drop")
     parser.add_argument("--https-port", type=int, default=DEFAULT_HTTPS_PORT)
+    parser.add_argument(
+        "--access-protected-public-base-url",
+        default=None,
+        help="Use Cloudflare Access at this exact HTTPS base URL instead of Tailnet mode",
+    )
+    parser.add_argument("--http-port", type=int, default=DEFAULT_HTTP_PORT, help="Cloudflare tunnel loopback origin port")
     parser.add_argument("--state-dir", type=Path, default=state_home / APP_NAME)
     parser.add_argument("--install-dir", type=Path, default=data_home / APP_NAME)
     parser.add_argument("--bin-dir", type=Path, default=Path.home() / ".local" / "bin")

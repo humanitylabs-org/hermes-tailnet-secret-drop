@@ -5,6 +5,7 @@ import json
 import os
 import stat
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
@@ -21,6 +22,75 @@ SPEC.loader.exec_module(installer)
 
 
 class InstallerTests(unittest.TestCase):
+    def test_dependency_preflight_enforces_the_declared_cryptography_interval(self):
+        completed = subprocess.CompletedProcess([sys.executable], 0, "", "")
+        with patch.object(installer, "run", return_value=completed) as run_mock:
+            installer.require_cryptography()
+        command = run_mock.call_args.args[0]
+        self.assertIn("version('cryptography')", command[2])
+        self.assertIn("41 <= int(m.group(1)) < 51", command[2])
+
+        failed = subprocess.CompletedProcess([sys.executable], 1, "", "")
+        with patch.object(installer, "run", return_value=failed), self.assertRaises(installer.InstallError):
+            installer.require_cryptography()
+
+    def test_cloudflare_migration_removes_only_its_owned_tailscale_listener(self):
+        previous = {
+            "mode": "tailscale-serve",
+            "public_base_url": "https://node.example.ts.net:8805",
+            "https_port": 8805,
+            "socket_path": "/private/secret-drop.sock",
+        }
+        present = json.dumps(
+            {
+                "Web": {
+                    "node.example.ts.net:8805": {
+                        "Handlers": {"/": {"Proxy": "unix:/private/secret-drop.sock"}}
+                    }
+                }
+            }
+        )
+        absent = json.dumps({"Web": {}})
+        responses = [
+            subprocess.CompletedProcess(["tailscale"], 0, present, ""),
+            subprocess.CompletedProcess(["tailscale"], 0, "", ""),
+            subprocess.CompletedProcess(["tailscale"], 0, absent, ""),
+        ]
+        with patch.object(installer.shutil, "which", return_value="/usr/bin/tailscale"):
+            with patch.object(installer, "run", side_effect=responses) as run_mock:
+                self.assertTrue(installer.remove_previous_tailscale_serve(previous))
+        commands = [call.args[0] for call in run_mock.call_args_list]
+        self.assertEqual(
+            commands[1],
+            ["/usr/bin/tailscale", "serve", "--yes", "--https=8805", "off"],
+        )
+
+    def test_cloudflare_migration_refuses_to_remove_a_reassigned_listener(self):
+        previous = {
+            "mode": "tailscale-serve",
+            "public_base_url": "https://node.example.ts.net:8805",
+            "https_port": 8805,
+            "socket_path": "/private/secret-drop.sock",
+        }
+        reassigned = subprocess.CompletedProcess(
+            ["tailscale"],
+            0,
+            json.dumps(
+                {
+                    "Web": {
+                        "node.example.ts.net:8805": {
+                            "Handlers": {"/": {"Proxy": "http://127.0.0.1:9999"}}
+                        }
+                    }
+                }
+            ),
+            "",
+        )
+        with patch.object(installer.shutil, "which", return_value="/usr/bin/tailscale"):
+            with patch.object(installer, "run", return_value=reassigned):
+                with self.assertRaises(installer.InstallError):
+                    installer.remove_previous_tailscale_serve(previous)
+
     def test_install_restarts_an_already_running_service(self):
         completed = subprocess.CompletedProcess(["systemctl"], 0, "", "")
         with patch.object(installer, "run", return_value=completed) as run_mock:
@@ -207,6 +277,12 @@ class InstallerTests(unittest.TestCase):
             staged_skill = hermes_home / "skills" / "hermes-tailnet-secret-drop" / "SKILL.md"
             self.assertTrue(staged_skill.is_file())
             self.assertEqual(stat.S_IMODE(state.stat().st_mode), 0o700)
+            encryption_key = state / "encryption-key.pem"
+            self.assertTrue(encryption_key.is_file())
+            self.assertEqual(stat.S_IMODE(encryption_key.stat().st_mode), 0o600)
+            installed_config = json.loads((state / "config.json").read_text(encoding="utf-8"))
+            self.assertEqual(installed_config["encryption_key_path"], str(encryption_key))
+            self.assertNotIn("public_key", installed_config)
 
             # The staging model has no in-repo duplicate: the installer copies the
             # canonical sources, so they must land byte-for-byte identical.
@@ -243,6 +319,57 @@ class InstallerTests(unittest.TestCase):
             )
             self.assertFalse(state.exists())
             self.assertFalse(install_dir.exists())
+
+    def test_cloudflare_access_staging_uses_exact_url_and_loopback_only(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            home = root / "home"
+            hermes_home = root / "hermes"
+            home.mkdir()
+            hermes_home.mkdir()
+            state = root / "state"
+            env = os.environ.copy()
+            env.update(
+                {
+                    "HOME": str(home),
+                    "HERMES_HOME": str(hermes_home),
+                    "PATH": "/usr/bin:/bin",
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                }
+            )
+            public_base = "https://drop.example.com/apps/hermes-secrets"
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(INSTALL_SCRIPT),
+                    "--no-start",
+                    "--access-protected-public-base-url",
+                    public_base,
+                    "--http-port",
+                    "18805",
+                    "--state-dir",
+                    str(state),
+                    "--install-dir",
+                    str(root / "install"),
+                    "--bin-dir",
+                    str(root / "bin"),
+                    "--unit-dir",
+                    str(root / "units"),
+                ],
+                text=True,
+                capture_output=True,
+                env=env,
+                cwd=ROOT,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["mode"], "cloudflare-access")
+            config = json.loads((state / "config.json").read_text(encoding="utf-8"))
+            self.assertEqual(config["public_base_url"], public_base)
+            self.assertEqual(config["access_protected_public_base_url"], public_base)
+            self.assertEqual(config["http_host"], "127.0.0.1")
+            self.assertEqual(config["http_port"], 18805)
+            self.assertFalse(any(key.startswith("https_") or key.startswith("tls_") for key in config))
 
     def test_uninstall_refuses_unmarked_and_symlinked_directories(self):
         with tempfile.TemporaryDirectory() as temp:

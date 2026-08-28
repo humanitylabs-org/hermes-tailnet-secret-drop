@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import base64
 import hashlib
 import http.client
 import importlib.util
@@ -13,12 +14,17 @@ import sys
 import tempfile
 import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.parse import urlsplit
+
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding, rsa
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 SCRIPT = Path(__file__).resolve().parents[1] / "src" / "secret_drop.py"
 SPEC = importlib.util.spec_from_file_location("secret_drop", SCRIPT)
@@ -30,6 +36,12 @@ PUBLIC_BASE_URL = "https://test-node.example.ts.net:8805"
 ORIGIN = "https://test-node.example.ts.net:8805"
 # Assembled at runtime so no source file ever contains a credential-shaped literal.
 FAKE_OPENROUTER_KEY = "sk-" + "or-v1-" + ("a1b2c3d4" * 8)
+TEST_PRIVATE_KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+TEST_PRIVATE_KEY_PEM = TEST_PRIVATE_KEY.private_bytes(
+    serialization.Encoding.PEM,
+    serialization.PrivateFormat.PKCS8,
+    serialization.NoEncryption(),
+)
 
 
 class UnixHTTPConnection(http.client.HTTPConnection):
@@ -89,13 +101,17 @@ class SecretDropTestCase(unittest.TestCase):
         self.state = self.root / "state"
         self.env = self.root / ".env"
         self.socket = self.state / "drop.sock"
+        self.encryption_key = self.state / "encryption-key.pem"
         self.config: dict[str, Any] = {
             "state_dir": str(self.state),
             "env_path": str(self.env),
             "socket_path": str(self.socket),
             "public_base_url": PUBLIC_BASE_URL,
+            "encryption_key_path": str(self.encryption_key),
         }
         secret_drop.ensure_private_dir(self.state)
+        self.encryption_key.write_bytes(TEST_PRIVATE_KEY_PEM)
+        self.encryption_key.chmod(0o600)
         self.server = None
         self.thread = None
 
@@ -131,21 +147,57 @@ class SecretDropTestCase(unittest.TestCase):
         assert self_test.fragment.startswith("token=")
         return self_test.fragment.split("=", 1)[1]
 
-    def get_metadata(self, capability: str, origin: str | None = None):
+    def get_metadata(self, capability: str | None, origin: str | None = None):
         headers = {secret_drop.TOKEN_HEADER: capability} if capability is not None else {}
         if origin is not None:
             headers["Origin"] = origin
         status, _, body = self.http("GET", "/api/request", None, headers)
         return status, body
 
-    def post_secret(self, capability: str | None, value: str, origin: str | None = ORIGIN, content_type="application/json"):
-        body = json.dumps({"secret": value})
+    def encrypted_envelope(self, capability: str | None, values: dict[str, str]):
+        request_id = secret_drop.capability_digest(capability) if capability and secret_drop.TOKEN_RE.fullmatch(capability) else "0" * 64
+        aes_key = os.urandom(32)
+        iv = os.urandom(12)
+        plaintext = json.dumps({"values": values}, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        ciphertext = AESGCM(aes_key).encrypt(iv, plaintext, secret_drop.encryption_aad(request_id))
+        wrapped_key = TEST_PRIVATE_KEY.public_key().encrypt(
+            aes_key,
+            padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None),
+        )
+        def encode(value):
+            return base64.urlsafe_b64encode(value).decode("ascii").rstrip("=")
+
+        return {
+            "version": secret_drop.ENVELOPE_VERSION,
+            "alg": secret_drop.ENVELOPE_ALGORITHM,
+            "enc": secret_drop.ENVELOPE_CIPHER,
+            "wrapped_key": encode(wrapped_key),
+            "iv": encode(iv),
+            "ciphertext": encode(ciphertext),
+        }
+
+    def post_envelope(
+        self,
+        capability: str | None,
+        envelope: dict[str, Any],
+        origin: str | None = ORIGIN,
+        content_type: str = "application/json",
+    ):
+        body = json.dumps(envelope)
         headers = {"Content-Type": content_type, "Content-Length": str(len(body))}
         if capability is not None:
             headers[secret_drop.TOKEN_HEADER] = capability
         if origin is not None:
             headers["Origin"] = origin
         return self.http("POST", "/api/secret", body, headers)
+
+    def post_secret(self, capability: str | None, value: str, origin: str | None = ORIGIN, content_type="application/json"):
+        return self.post_envelope(
+            capability,
+            self.encrypted_envelope(capability, {"secret": value}),
+            origin=origin,
+            content_type=content_type,
+        )
 
     def state_files_contain(self, needle: str) -> bool:
         for path in self.state.rglob("*"):
@@ -159,6 +211,250 @@ class SecretDropTestCase(unittest.TestCase):
             except (OSError, UnicodeDecodeError):
                 continue
         return False
+
+
+class EncryptionEnvelopeTests(SecretDropTestCase):
+    def test_client_uses_hybrid_webcrypto_and_posts_only_the_envelope(self):
+        script = secret_drop.CLIENT_SCRIPT
+        for required in (
+            "window.crypto.subtle",
+            "name: 'AES-GCM'",
+            "length: 256",
+            "name: 'RSA-OAEP'",
+            "hash: 'SHA-256'",
+            "body: JSON.stringify(envelope)",
+            "plaintext.fill(0)",
+            "rawKey.fill(0)",
+        ):
+            self.assertIn(required, script)
+        self.assertNotIn("JSON.stringify({secret", script)
+        self.assertNotIn("body: JSON.stringify(values)", script)
+        self.assertNotIn("plaintext fallback", script.casefold())
+        self.assertIn("credentials: 'same-origin'", script)
+        self.assertNotIn("credentials: 'omit'", script)
+
+    def test_public_spki_is_only_returned_by_capability_protected_metadata(self):
+        created = self.create()
+        capability = self.capability(created)
+        self.start_server()
+        status, _, shell = self.http("GET", "/")
+        self.assertEqual(status, 200)
+        status, _, health = self.http("GET", "/health")
+        self.assertEqual(status, 200)
+        expected_spki = secret_drop.encryption_public_spki(self.config)
+        self.assertNotIn(expected_spki.encode(), shell)
+        self.assertNotIn(expected_spki.encode(), health)
+        status, missing = self.get_metadata(None)
+        self.assertEqual(status, 404)
+        self.assertNotIn(expected_spki.encode(), missing)
+        status, body = self.get_metadata(capability)
+        self.assertEqual(status, 200)
+        metadata = json.loads(body)
+        self.assertEqual(metadata["encryption"]["public_key_spki"], expected_spki)
+        loaded = serialization.load_der_public_key(base64.b64decode(expected_spki))
+        self.assertIsInstance(loaded, rsa.RSAPublicKey)
+        self.assertEqual(loaded.public_numbers(), TEST_PRIVATE_KEY.public_key().public_numbers())
+
+    def test_plaintext_malformed_and_tampered_bodies_do_not_consume_request(self):
+        created = self.create(key="EXAMPLE_API_KEY", label="Example API key")
+        capability = self.capability(created)
+        self.start_server()
+        good = self.encrypted_envelope(capability, {"secret": "correct-value"})
+        variants = [
+            {"secret": "plaintext-is-forbidden"},
+            {**good, "alg": "RSA-OAEP"},
+            {**good, "extra": "field"},
+            {**good, "iv": good["iv"][:-1] + ("A" if good["iv"][-1] != "A" else "B")},
+            {**good, "ciphertext": good["ciphertext"][:-1] + ("A" if good["ciphertext"][-1] != "A" else "B")},
+            {**good, "wrapped_key": good["wrapped_key"][:-1] + ("A" if good["wrapped_key"][-1] != "A" else "B")},
+        ]
+        for envelope in variants:
+            with self.subTest(keys=sorted(envelope)):
+                status, _, body = self.post_envelope(capability, envelope)
+                self.assertEqual(status, 400)
+                self.assertNotIn(b"plaintext-is-forbidden", body)
+                _, state = secret_drop.load_request(self.config, created["request_id"])
+                self.assertEqual(state["status"], "pending")
+                self.assertFalse(self.env.exists())
+        status, _, _ = self.post_envelope(capability, good)
+        self.assertEqual(status, 200)
+        self.assertIn("EXAMPLE_API_KEY=", self.env.read_text(encoding="utf-8"))
+
+    def test_ciphertext_is_bound_to_its_capability_digest(self):
+        first = self.create(key="FIRST_API_KEY", label="First API key")
+        second = self.create(key="SECOND_API_KEY", label="Second API key")
+        first_capability = self.capability(first)
+        second_capability = self.capability(second)
+        envelope = self.encrypted_envelope(first_capability, {"secret": "bound-value"})
+        self.start_server()
+        status, _, _ = self.post_envelope(second_capability, envelope)
+        self.assertEqual(status, 400)
+        for created in (first, second):
+            _, state = secret_drop.load_request(self.config, created["request_id"])
+            self.assertEqual(state["status"], "pending")
+        self.assertFalse(self.env.exists())
+
+    def test_total_value_limit_is_64_kib_and_failure_is_reusable(self):
+        created = self.create(key="EXAMPLE_API_KEY", label="Example API key")
+        capability = self.capability(created)
+        self.start_server()
+        status, _, _ = self.post_secret(capability, "x" * (secret_drop.MAX_SECRET_BYTES + 1))
+        self.assertEqual(status, 400)
+        _, state = secret_drop.load_request(self.config, created["request_id"])
+        self.assertEqual(state["status"], "pending")
+
+
+class EncryptionKeyTests(SecretDropTestCase):
+    def test_key_helper_creates_one_0600_rsa_key_and_never_replaces_it(self):
+        key_path = self.root / "new-state" / "encryption-key.pem"
+        self.assertTrue(secret_drop.generate_encryption_private_key(key_path))
+        first = key_path.read_bytes()
+        self.assertEqual(stat.S_IMODE(key_path.stat().st_mode), 0o600)
+        self.assertGreaterEqual(secret_drop.load_encryption_private_key(key_path).key_size, 2048)
+        self.assertFalse(secret_drop.generate_encryption_private_key(key_path))
+        self.assertEqual(key_path.read_bytes(), first)
+
+    def test_concurrent_key_generation_publishes_one_valid_key_without_deletion(self):
+        key_path = self.root / "concurrent-state" / "encryption-key.pem"
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            results = list(executor.map(lambda _: secret_drop.generate_encryption_private_key(key_path), range(4)))
+        self.assertEqual(results.count(True), 1)
+        self.assertEqual(results.count(False), 3)
+        self.assertTrue(key_path.is_file())
+        self.assertEqual(stat.S_IMODE(key_path.stat().st_mode), 0o600)
+        self.assertEqual(key_path.stat().st_nlink, 1)
+        self.assertGreaterEqual(secret_drop.load_encryption_private_key(key_path).key_size, 2048)
+
+    def test_key_loader_rejects_broad_modes_hardlinks_and_symlinks(self):
+        self.encryption_key.chmod(0o644)
+        with self.assertRaises(secret_drop.SecretDropError):
+            secret_drop.load_encryption_private_key(self.encryption_key)
+        self.encryption_key.chmod(0o600)
+        hardlink = self.root / "hardlink.pem"
+        os.link(self.encryption_key, hardlink)
+        with self.assertRaises(secret_drop.SecretDropError):
+            secret_drop.load_encryption_private_key(self.encryption_key)
+        hardlink.unlink()
+        symlink = self.root / "symlink.pem"
+        symlink.symlink_to(self.encryption_key)
+        with self.assertRaises(secret_drop.SecretDropError):
+            secret_drop.load_encryption_private_key(symlink)
+
+
+class CloudflareAccessTests(SecretDropTestCase):
+    ACCESS_BASE = "https://drop.example.com/apps/hermes-secrets"
+
+    def access_config(self, **overrides):
+        config = {
+            **self.config,
+            "mode": "cloudflare-access",
+            "public_base_url": self.ACCESS_BASE,
+            "access_protected_public_base_url": self.ACCESS_BASE,
+            "http_host": "127.0.0.1",
+            "http_port": 8805,
+        }
+        config.update(overrides)
+        return config
+
+    def test_config_requires_exact_access_url_and_ipv4_loopback(self):
+        config_path = self.root / "config.json"
+        valid = self.access_config()
+        config_path.write_text(json.dumps(valid), encoding="utf-8")
+        self.assertEqual(secret_drop.load_config(config_path)["mode"], "cloudflare-access")
+        for changes in (
+            {"access_protected_public_base_url": "https://drop.example.com/apps/other"},
+            {"http_host": "0.0.0.0"},
+            {"http_host": "::1"},
+            {"http_port": 80},
+            {"public_base_url": self.ACCESS_BASE + "/"},
+        ):
+            invalid = self.access_config(**changes)
+            config_path.write_text(json.dumps(invalid), encoding="utf-8")
+            with self.subTest(changes=changes), self.assertRaises(secret_drop.SecretDropError):
+                secret_drop.load_config(config_path)
+
+    def test_public_path_prefix_exposes_only_the_fixed_routes(self):
+        self.config = self.access_config()
+        created = self.create(key="EXAMPLE_API_KEY", label="Example API key")
+        capability = self.capability(created)
+        self.assertTrue(created["request_url"].startswith(self.ACCESS_BASE + "/#token="))
+        self.start_server()
+        status, _, _ = self.http("GET", "/")
+        self.assertEqual(status, 404)
+        status, _, _ = self.http("GET", "/health")
+        self.assertEqual(status, 404)
+        status, _, _ = self.http("GET", "/apps/hermes-secrets/")
+        self.assertEqual(status, 200)
+        status, _, health = self.http("GET", "/apps/hermes-secrets/health")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(health), {"status": "ok", "version": secret_drop.APP_VERSION})
+        headers = {secret_drop.TOKEN_HEADER: capability, "Origin": "https://drop.example.com"}
+        status, _, metadata = self.http("GET", "/apps/hermes-secrets/api/request", None, headers)
+        self.assertEqual(status, 200)
+        self.assertNotIn(b"EXAMPLE_API_KEY", metadata)
+        envelope = self.encrypted_envelope(capability, {"secret": "prefix-bound"})
+        body = json.dumps(envelope)
+        headers.update({"Content-Type": "application/json", "Content-Length": str(len(body))})
+        status, _, _ = self.http("POST", "/apps/hermes-secrets/api/secret", body, headers)
+        self.assertEqual(status, 200)
+
+    def test_loopback_server_refuses_every_non_loopback_bind_value(self):
+        with self.assertRaises(secret_drop.SecretDropError):
+            secret_drop.SecretDropLoopbackServer("0.0.0.0", 0, self.access_config())
+
+
+class BundleTests(SecretDropTestCase):
+    def create_bundle(self):
+        return secret_drop.create_bundle_request(
+            self.config,
+            "Provider credentials",
+            [
+                {"env_key": "PROVIDER_API_KEY", "label": "Provider API key", "validator": "opaque"},
+                {"env_key": "PROVIDER_ACCOUNT_TOKEN", "label": "Provider account token", "validator": "opaque"},
+            ],
+            30,
+        )
+
+    def test_bundle_metadata_hides_destinations_and_saves_all_values_atomically(self):
+        created = self.create_bundle()
+        capability = self.capability(created)
+        self.start_server()
+        status, body = self.get_metadata(capability)
+        self.assertEqual(status, 200)
+        metadata = json.loads(body)
+        self.assertEqual(metadata["submit_label"], "Save all")
+        self.assertNotIn("PROVIDER_API_KEY", body.decode("utf-8"))
+        envelope = self.encrypted_envelope(
+            capability,
+            {"secret_0": "api-value", "secret_1": "account-value"},
+        )
+        status, _, _ = self.post_envelope(capability, envelope)
+        self.assertEqual(status, 200)
+        env_text = self.env.read_text(encoding="utf-8")
+        self.assertIn("PROVIDER_API_KEY='api-value'", env_text)
+        self.assertIn("PROVIDER_ACCOUNT_TOKEN='account-value'", env_text)
+
+    def test_incomplete_bundle_does_not_write_or_consume(self):
+        created = self.create_bundle()
+        capability = self.capability(created)
+        self.start_server()
+        envelope = self.encrypted_envelope(capability, {"secret_0": "only-one"})
+        status, _, _ = self.post_envelope(capability, envelope)
+        self.assertEqual(status, 400)
+        self.assertFalse(self.env.exists())
+        _, state = secret_drop.load_request(self.config, created["request_id"])
+        self.assertEqual(state["status"], "pending")
+
+    def test_bundle_and_single_requests_supersede_on_any_overlapping_key(self):
+        bundle = self.create_bundle()
+        replacement = self.create(key="PROVIDER_ACCOUNT_TOKEN", label="Replacement token")
+        self.assertEqual(replacement["superseded_requests"], 1)
+        with self.assertRaises(secret_drop.SecretDropError):
+            secret_drop.load_request(self.config, bundle["request_id"])
+        other_bundle = self.create_bundle()
+        self.assertEqual(other_bundle["superseded_requests"], 1)
+        with self.assertRaises(secret_drop.SecretDropError):
+            secret_drop.load_request(self.config, replacement["request_id"])
 
 
 class CapabilityAndStorageTests(SecretDropTestCase):
@@ -222,7 +518,7 @@ class AppShellTests(SecretDropTestCase):
         self.assertIn("history.replaceState", text)
         self.assertIn(secret_drop.TOKEN_HEADER, text)
         self.assertIn('id="secret-form"', text)
-        self.assertIn('id="reveal-secret"', text)
+        self.assertIn("className = 'reveal'", text)
         self.assertIn('id="countdown"', text)
         self.assertNotIn("Save &amp; test", text)
         self.assertIn('type="submit">Save</button>', text)
@@ -298,6 +594,9 @@ class HeaderCapabilityTests(SecretDropTestCase):
         self.assertEqual(payload["status"], "pending")
         self.assertEqual(payload["mode"], "secret")
         self.assertGreater(payload["expires_in_seconds"], 0)
+        self.assertEqual(payload["encryption"]["alg"], "RSA-OAEP-256")
+        self.assertEqual(payload["encryption"]["enc"], "A256GCM")
+        self.assertEqual(payload["fields"], [{"name": "secret", "label": "Private calendar ICS URL"}])
         self.assertNotIn("env_key", payload)
         self.assertNotIn(capability, body.decode("utf-8"))
 
@@ -458,7 +757,7 @@ class AdapterTests(SecretDropTestCase):
         self.assertEqual(status, 200)
         payload = json.loads(body)
         self.assertEqual(payload["submit_label"], "Save")
-        self.assertEqual(payload["progress_label"], "Saving…")
+        self.assertEqual(payload["progress_label"], "Encrypting…")
         self.assertNotIn(b"validator", body)
 
 
