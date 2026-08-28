@@ -3,13 +3,13 @@
 The fenced text below is the exact Humanity Labs copy prompt.
 
 ```text
-Install Hermes Secret Drop v1.3.0 from https://github.com/humanitylabs-org/hermes-tailnet-secret-drop on this Hermes VPS. Use the recommended Cloudflare Access mode so I can enter API keys, tokens, passwords, and private URLs without pasting them into AI chat.
+Install Hermes Secret Drop v1.3.1 from https://github.com/humanitylabs-org/hermes-tailnet-secret-drop on this Hermes VPS. Use the recommended Cloudflare Access mode so I can enter API keys, tokens, passwords, and private URLs without pasting them into AI chat.
 
 Complete and verify the installation:
 
 1. Check for Linux, Python 3.10+, git, systemd user services, Hermes Agent, and the Python dependency in requirements.txt. Confirm I already have an exact Cloudflare Access-protected HTTPS route and Tunnel origin for Secret Drop. The origin must be `http://127.0.0.1:<port>`; do not expose a public listener. If a package or privileged action is needed, ask before running sudo or any package-manager command.
 
-2. Clone the repository at reviewed tag `v1.3.0`, or safely update an existing clean checkout to that tag. Do not overwrite unrelated changes. Verify `git describe --tags --exact-match` returns `v1.3.0`.
+2. Clone the repository at reviewed tag `v1.3.1`, or safely update an existing clean checkout to that tag. Do not overwrite unrelated changes. Verify `git describe --tags --exact-match` returns `v1.3.1`.
 
 3. Run `./scripts/prereq-check.sh --mode cloudflare-access`, fix missing requirements one safe step at a time, then run `./scripts/setup.sh --access-protected-public-base-url <exact-access-url> --http-port <loopback-port>`.
 
