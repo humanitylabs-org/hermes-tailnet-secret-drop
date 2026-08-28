@@ -137,6 +137,10 @@ python3 scripts/uninstall.py
 
 Uninstall stops the service, removes its configured listener and active request metadata, and removes the local package and skill. It does **not** delete secrets already saved in the Hermes `.env`.
 
+## What changed in 1.3.1
+
+- Cloudflare migration now fails closed when an existing installer-owned Tailscale Serve route is recorded but the Tailscale CLI is unavailable, preventing an unverified legacy route from surviving a reported-success migration.
+
 ## What changed in 1.3.0
 
 - Added strict browser-side hybrid encryption: AES-256-GCM plus RSA-OAEP/SHA-256, bound to the capability digest

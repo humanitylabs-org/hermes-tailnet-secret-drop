@@ -66,6 +66,17 @@ class InstallerTests(unittest.TestCase):
             ["/usr/bin/tailscale", "serve", "--yes", "--https=8805", "off"],
         )
 
+    def test_cloudflare_migration_fails_closed_when_tailscale_cli_is_unavailable(self):
+        previous = {
+            "mode": "tailscale-serve",
+            "public_base_url": "https://node.example.ts.net:8805",
+            "https_port": 8805,
+            "socket_path": "/private/secret-drop.sock",
+        }
+        with patch.object(installer.shutil, "which", return_value=None):
+            with self.assertRaisesRegex(installer.InstallError, "Tailscale CLI is unavailable"):
+                installer.remove_previous_tailscale_serve(previous)
+
     def test_cloudflare_migration_refuses_to_remove_a_reassigned_listener(self):
         previous = {
             "mode": "tailscale-serve",

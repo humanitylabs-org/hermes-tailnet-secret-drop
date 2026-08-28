@@ -216,7 +216,10 @@ def remove_previous_tailscale_serve(previous_config: dict[str, Any]) -> bool:
         raise InstallError("The previous Tailscale Serve ownership record is invalid; refusing broad cleanup.")
     tailscale_bin = shutil.which("tailscale")
     if not tailscale_bin:
-        return False
+        raise InstallError(
+            "The previous installation records an active Tailscale Serve route, but the Tailscale CLI is unavailable. "
+            "Refusing to complete the Cloudflare migration without verifying and removing that exact route."
+        )
 
     def owned_proxy() -> str | None:
         result = run([tailscale_bin, "serve", "status", "--json"], check=False)
