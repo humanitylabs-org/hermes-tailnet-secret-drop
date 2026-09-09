@@ -43,7 +43,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-APP_VERSION = "1.3.2-telos.2"
+APP_VERSION = "1.3.2-telos.3"
 USER_AGENT = f"Hermes-Tailnet-Secret-Drop/{APP_VERSION}"
 DEFAULT_TTL_MINUTES = 1440
 MAX_TTL_MINUTES = 1440
@@ -97,9 +97,11 @@ CLIENT_SCRIPT = """(() => {
   const encoder = new TextEncoder();
   const fragmentMatch = /^#token=([A-Za-z0-9_-]{32,128})$/.exec(window.location.hash || '');
   const queryMatch = /^\\?token=([A-Za-z0-9_-]{32,128})$/.exec(window.location.search || '');
-  const capability = fragmentMatch ? fragmentMatch[1] : (queryMatch ? queryMatch[1] : '');
+  const pathMatch = /[/]drop[/]([A-Za-z0-9_-]{32,128})[/]?$/.exec(window.location.pathname || '');
+  const capability = fragmentMatch ? fragmentMatch[1] : (queryMatch ? queryMatch[1] : (pathMatch ? pathMatch[1] : ''));
   if (capability && window.history && window.history.replaceState) {
-    window.history.replaceState(null, '', window.location.pathname);
+    const cleanPath = pathMatch ? window.location.pathname.slice(0, pathMatch.index + 1) : window.location.pathname;
+    window.history.replaceState(null, '', cleanPath);
   }
 
   const heading = document.getElementById('heading');
@@ -1038,7 +1040,7 @@ def create_request(
 
     return {
         "request_id": request_id,
-        "request_url": f"{config['public_base_url']}/?token={capability}",
+        "request_url": f"{config['public_base_url']}/drop/{capability}",
         "expires_at": payload["expires_at"],
         "status": "pending",
         "mode": payload["mode"],
@@ -1110,7 +1112,7 @@ def create_bundle_request(
         atomic_write_json(path, payload)
     return {
         "request_id": request_id,
-        "request_url": f"{config['public_base_url']}/?token={capability}",
+        "request_url": f"{config['public_base_url']}/drop/{capability}",
         "expires_at": payload["expires_at"],
         "status": "pending",
         "mode": "secret",
@@ -1604,7 +1606,7 @@ class SecretDropHandler(BaseHTTPRequestHandler):
             body = json.dumps({"status": "ok", "version": APP_VERSION}, separators=(",", ":")).encode("utf-8")
             self._send(HTTPStatus.OK, body, "application/json; charset=utf-8")
             return
-        if path == "/":
+        if path == "/" or (path is not None and re.fullmatch(r"/drop/[A-Za-z0-9_-]{32,128}/?", path)):
             self._send(HTTPStatus.OK, APP_SHELL)
             return
         if path == "/api/request":

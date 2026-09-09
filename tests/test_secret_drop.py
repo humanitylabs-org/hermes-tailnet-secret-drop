@@ -7,6 +7,7 @@ import http.client
 import importlib.util
 import json
 import os
+import re
 import socket
 import stat
 import subprocess
@@ -144,6 +145,9 @@ class SecretDropTestCase(unittest.TestCase):
     def capability(created: dict) -> str:
         url = created["request_url"]
         self_test = urlsplit(url)
+        match = re.search(r"/drop/([A-Za-z0-9_-]{32,128})/?$", self_test.path)
+        if match:
+            return match.group(1)
         assert self_test.query.startswith("token=")
         assert not self_test.fragment
         return self_test.query.split("=", 1)[1]
@@ -378,7 +382,7 @@ class CloudflareAccessTests(SecretDropTestCase):
         self.config = self.access_config()
         created = self.create(key="EXAMPLE_API_KEY", label="Example API key")
         capability = self.capability(created)
-        self.assertTrue(created["request_url"].startswith(self.ACCESS_BASE + "/?token="))
+        self.assertTrue(created["request_url"].startswith(self.ACCESS_BASE + "/drop/"))
         self.start_server()
         status, _, _ = self.http("GET", "/")
         self.assertEqual(status, 404)
@@ -386,6 +390,9 @@ class CloudflareAccessTests(SecretDropTestCase):
         self.assertEqual(status, 404)
         status, _, _ = self.http("GET", "/apps/hermes-secrets/")
         self.assertEqual(status, 200)
+        status, _, shell = self.http("GET", f"/apps/hermes-secrets/drop/{capability}")
+        self.assertEqual(status, 200)
+        self.assertIn(b"Hermes Secret Drop", shell)
         status, _, health = self.http("GET", "/apps/hermes-secrets/health")
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(health), {"status": "ok", "version": secret_drop.APP_VERSION})
@@ -459,16 +466,16 @@ class BundleTests(SecretDropTestCase):
 
 
 class CapabilityAndStorageTests(SecretDropTestCase):
-    def test_request_url_carries_the_capability_in_access_safe_query(self):
+    def test_request_url_carries_the_capability_in_access_safe_path(self):
         created = self.create()
         url = created["request_url"]
         parsed = urlsplit(url)
         capability = self.capability(created)
-        self.assertEqual(url, f"{PUBLIC_BASE_URL}/?token={capability}")
-        self.assertEqual(parsed.path, "/")
-        self.assertEqual(parsed.query, f"token={capability}")
+        self.assertEqual(url, f"{PUBLIC_BASE_URL}/drop/{capability}")
+        self.assertEqual(parsed.path, f"/drop/{capability}")
+        self.assertEqual(parsed.query, "")
         self.assertEqual(parsed.fragment, "")
-        self.assertNotIn(capability, f"{parsed.scheme}://{parsed.netloc}{parsed.path}")
+        self.assertNotIn(capability, f"{parsed.scheme}://{parsed.netloc}")
         self.assertTrue(secret_drop.TOKEN_RE.fullmatch(capability))
 
     def test_only_the_capability_digest_is_stored_on_disk(self):
