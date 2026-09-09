@@ -144,8 +144,9 @@ class SecretDropTestCase(unittest.TestCase):
     def capability(created: dict) -> str:
         url = created["request_url"]
         self_test = urlsplit(url)
-        assert self_test.fragment.startswith("token=")
-        return self_test.fragment.split("=", 1)[1]
+        assert self_test.query.startswith("token=")
+        assert not self_test.fragment
+        return self_test.query.split("=", 1)[1]
 
     def get_metadata(self, capability: str | None, origin: str | None = None):
         headers = {secret_drop.TOKEN_HEADER: capability} if capability is not None else {}
@@ -377,7 +378,7 @@ class CloudflareAccessTests(SecretDropTestCase):
         self.config = self.access_config()
         created = self.create(key="EXAMPLE_API_KEY", label="Example API key")
         capability = self.capability(created)
-        self.assertTrue(created["request_url"].startswith(self.ACCESS_BASE + "/#token="))
+        self.assertTrue(created["request_url"].startswith(self.ACCESS_BASE + "/?token="))
         self.start_server()
         status, _, _ = self.http("GET", "/")
         self.assertEqual(status, 404)
@@ -458,16 +459,16 @@ class BundleTests(SecretDropTestCase):
 
 
 class CapabilityAndStorageTests(SecretDropTestCase):
-    def test_request_url_carries_the_capability_only_in_the_fragment(self):
+    def test_request_url_carries_the_capability_in_access_safe_query(self):
         created = self.create()
         url = created["request_url"]
         parsed = urlsplit(url)
         capability = self.capability(created)
-        self.assertEqual(url, f"{PUBLIC_BASE_URL}/#token={capability}")
+        self.assertEqual(url, f"{PUBLIC_BASE_URL}/?token={capability}")
         self.assertEqual(parsed.path, "/")
-        self.assertEqual(parsed.query, "")
-        self.assertEqual(parsed.fragment, f"token={capability}")
-        self.assertNotIn(capability, f"{parsed.scheme}://{parsed.netloc}{parsed.path}{parsed.query}")
+        self.assertEqual(parsed.query, f"token={capability}")
+        self.assertEqual(parsed.fragment, "")
+        self.assertNotIn(capability, f"{parsed.scheme}://{parsed.netloc}{parsed.path}")
         self.assertTrue(secret_drop.TOKEN_RE.fullmatch(capability))
 
     def test_only_the_capability_digest_is_stored_on_disk(self):

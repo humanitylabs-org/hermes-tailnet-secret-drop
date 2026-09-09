@@ -143,6 +143,8 @@ Uninstall stops the service, removes its configured listener and active request 
 
 James's `1.3.2-telos.1` deployment changes the request default and hard maximum to 24 hours. Single-use consumption, scoped supersession, Access authentication, browser encryption, and automatic expiry remain unchanged.
 
+`1.3.2-telos.2` carries the one-time capability through Cloudflare Access as a query parameter, then removes it from the browser address before accepting input. This avoids login redirects and chat clients dropping URL fragments. The tradeoff is that Cloudflare can observe the capability in routing metadata until the page loads; Access authentication, one-time consumption, 24-hour expiry, and browser-side encryption still apply.
+
 ## What changed in 1.3.1
 
 - Cloudflare migration now fails closed when an existing installer-owned Tailscale Serve route is recorded but the Tailscale CLI is unavailable, preventing an unverified legacy route from surviving a reported-success migration.

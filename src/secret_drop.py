@@ -43,7 +43,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-APP_VERSION = "1.3.2-telos.1"
+APP_VERSION = "1.3.2-telos.2"
 USER_AGENT = f"Hermes-Tailnet-Secret-Drop/{APP_VERSION}"
 DEFAULT_TTL_MINUTES = 1440
 MAX_TTL_MINUTES = 1440
@@ -95,9 +95,10 @@ CLIENT_SCRIPT = """(() => {
   const TOKEN_HEADER = 'X-Secret-Drop-Token';
   const MAX_VALUE_BYTES = 65536;
   const encoder = new TextEncoder();
-  const found = /^#token=([A-Za-z0-9_-]{32,128})$/.exec(window.location.hash || '');
-  const capability = found ? found[1] : '';
-  if (found && window.history && window.history.replaceState) {
+  const fragmentMatch = /^#token=([A-Za-z0-9_-]{32,128})$/.exec(window.location.hash || '');
+  const queryMatch = /^\\?token=([A-Za-z0-9_-]{32,128})$/.exec(window.location.search || '');
+  const capability = fragmentMatch ? fragmentMatch[1] : (queryMatch ? queryMatch[1] : '');
+  if (capability && window.history && window.history.replaceState) {
     window.history.replaceState(null, '', window.location.pathname);
   }
 
@@ -251,7 +252,7 @@ CLIENT_SCRIPT = """(() => {
   };
 
   if (!capability) {
-    finish('Not found', 'Open the whole Secret Drop link, including the part after the # symbol.');
+    finish('Not found', 'Open the complete Secret Drop link, including its token.');
     return;
   }
   if (!window.crypto || !window.crypto.subtle) {
@@ -1037,7 +1038,7 @@ def create_request(
 
     return {
         "request_id": request_id,
-        "request_url": f"{config['public_base_url']}/#token={capability}",
+        "request_url": f"{config['public_base_url']}/?token={capability}",
         "expires_at": payload["expires_at"],
         "status": "pending",
         "mode": payload["mode"],
@@ -1109,7 +1110,7 @@ def create_bundle_request(
         atomic_write_json(path, payload)
     return {
         "request_id": request_id,
-        "request_url": f"{config['public_base_url']}/#token={capability}",
+        "request_url": f"{config['public_base_url']}/?token={capability}",
         "expires_at": payload["expires_at"],
         "status": "pending",
         "mode": "secret",
