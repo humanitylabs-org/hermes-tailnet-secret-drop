@@ -1054,13 +1054,13 @@ class LifecycleTests(SecretDropTestCase):
         self.assertNotIn("capability", state)
         self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
 
-    def test_request_lifetime_defaults_to_two_hours(self):
+    def test_request_lifetime_defaults_to_twenty_four_hours(self):
         with self.assertRaises(secret_drop.SecretDropError):
-            self.create(ttl=121)
-        self.assertEqual(secret_drop.DEFAULT_TTL_MINUTES, 120)
-        self.assertEqual(secret_drop.MAX_TTL_MINUTES, 120)
+            self.create(ttl=1441)
+        self.assertEqual(secret_drop.DEFAULT_TTL_MINUTES, 1440)
+        self.assertEqual(secret_drop.MAX_TTL_MINUTES, 1440)
 
-    def test_private_deployment_can_raise_request_lifetime_cap(self):
+    def test_private_deployment_can_lower_request_lifetime_cap(self):
         self.config["max_ttl_minutes"] = 300
         created = self.create(ttl=300)
         self.assertEqual(created["status"], "pending")
@@ -1070,7 +1070,7 @@ class LifecycleTests(SecretDropTestCase):
     def test_configured_request_lifetime_cannot_exceed_hard_cap(self):
         self.config["max_ttl_minutes"] = secret_drop.HARD_MAX_TTL_MINUTES + 1
         with self.assertRaises(secret_drop.SecretDropError):
-            self.create(ttl=120)
+            self.create(ttl=1440)
 
     def test_write_only_http_flow_saves_once_then_destroys_link(self):
         created = self.create()

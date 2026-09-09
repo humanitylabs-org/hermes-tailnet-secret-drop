@@ -97,7 +97,7 @@ API-key or account verification requires an adapter. The `google-calendar-ics` v
 
 ## Link lifecycle
 
-- Default lifetime: two hours; private operators may configure up to the five-hour package hard cap
+- Default and hard maximum: 24 hours; private operators may configure a shorter cap
 - Single use: a successful submission retires the active request
 - Supersession: a newer request retires older pending requests that overlap any destination key
 - Validation first: rejected values preserve the previous `.env` and keep the link reusable
@@ -140,6 +140,8 @@ Uninstall stops the service, removes its configured listener and active request 
 ## What changed in 1.3.2
 
 - A failed legacy Tailscale Serve cleanup is now retained as a minimal pending ownership record in the Cloudflare configuration. Every retry remains fail-closed until that exact predecessor route is verified absent or safely removed.
+
+James's `1.3.2-telos.1` deployment changes the request default and hard maximum to 24 hours. Single-use consumption, scoped supersession, Access authentication, browser encryption, and automatic expiry remain unchanged.
 
 ## What changed in 1.3.1
 

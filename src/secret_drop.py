@@ -43,11 +43,11 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-APP_VERSION = "1.3.2"
+APP_VERSION = "1.3.2-telos.1"
 USER_AGENT = f"Hermes-Tailnet-Secret-Drop/{APP_VERSION}"
-DEFAULT_TTL_MINUTES = 120
-MAX_TTL_MINUTES = 120
-HARD_MAX_TTL_MINUTES = 300
+DEFAULT_TTL_MINUTES = 1440
+MAX_TTL_MINUTES = 1440
+HARD_MAX_TTL_MINUTES = 1440
 CLEANUP_INTERVAL_SECONDS = 30
 TOMBSTONE_KEEP_HOURS = 24
 MAX_SECRET_BYTES = 64 * 1024
