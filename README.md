@@ -145,6 +145,8 @@ Uninstall stops the service, removes its configured listener and active request 
 
 James's `1.3.2-telos.1` deployment changes the request default and hard maximum to 24 hours. Single-use consumption, scoped supersession, Access authentication, browser encryption, and automatic expiry remain unchanged.
 
+`1.3.2-telos.4` wears the Wizard OS skin. Inside a Wizard window it follows the shell's Appearance v1 roles (Nebula, Grove, Tide, Ember, Signal) and live skin changes; as a plain tab it paints its own dark or light theme. Theme handling is colour-only and grants no capability.
+
 `1.3.2-telos.3` carries the one-time capability through Cloudflare Access as a path segment, then removes it from the browser address before accepting input. This avoids login redirects and chat clients dropping fragments or queries. The tradeoff is that Cloudflare can observe the capability in routing metadata until the page loads; Access authentication, one-time consumption, 24-hour expiry, and browser-side encryption still apply.
 
 ## What changed in 1.3.1

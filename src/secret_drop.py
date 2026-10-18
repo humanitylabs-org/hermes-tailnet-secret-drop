@@ -43,7 +43,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-APP_VERSION = "1.3.2-telos.3"
+APP_VERSION = "1.3.2-telos.4"
 USER_AGENT = f"Hermes-Tailnet-Secret-Drop/{APP_VERSION}"
 DEFAULT_TTL_MINUTES = 1440
 MAX_TTL_MINUTES = 1440
@@ -97,6 +97,74 @@ DANGEROUS_KEYS = {
 DANGEROUS_PREFIXES = ("LD_", "SUDO_", "SYSTEMD_", "XDG_")
 CLIENT_SCRIPT = """(() => {
   'use strict';
+  // Wizard OS Appearance v1: wear the shell's skin. Theme colours only; this grants nothing.
+  const root = document.documentElement;
+  const ORIGIN = window.location.origin;
+  const TOKENS = ['base', 'chrome', 'surface', 'surface-raised', 'text', 'text-secondary', 'text-muted', 'border', 'accent', 'accent-soft', 'on-accent'];
+  const isColor = (v) => typeof v === 'string' && v.length > 0 && v.length < 96 && !/[;{}]|url[(]/i.test(v) &&
+    (!window.CSS || !window.CSS.supports || window.CSS.supports('color', v));
+  let framed = false;
+  try { framed = window.parent !== window; } catch (_e) { framed = true; }
+  let hostDoc = null;
+  if (framed) { try { hostDoc = window.parent.document; } catch (_e) { hostDoc = null; } }
+  let themedRevision = -1;
+  root.dataset.mode = framed ? 'framed' : 'standalone';
+  const paint = (skin, scheme, presentation, tokens, mode) => {
+    TOKENS.forEach((k) => { if (isColor(tokens[k])) root.style.setProperty('--wz-' + k, tokens[k]); });
+    root.style.colorScheme = scheme;
+    root.dataset.skin = skin;
+    root.dataset.colorScheme = scheme;
+    root.dataset.presentation = presentation;
+    root.dataset.mode = mode;
+  };
+  // Same-origin Wizard window that does not hand out an appearance context: mirror the shell's own roles.
+  const fromHost = () => {
+    if (!hostDoc || themedRevision >= 0) return;
+    try {
+      const el = hostDoc.documentElement;
+      const s = window.parent.getComputedStyle(el);
+      const read = (k, f) => { const v = s.getPropertyValue('--' + k).trim(); return isColor(v) ? v : f; };
+      const words = (s.colorScheme || '').trim().split(' ');
+      const light = words.includes('light') && !words.includes('dark');
+      const base = read('bg', light ? '#f6f3ec' : '#05030c');
+      const ink = read('ink', light ? '#1d1b17' : '#f3efff');
+      const accent = read('violet-2', '#b99bff');
+      const skin = /^[a-z0-9-]{1,40}$/.test(el.dataset.skin || '') ? el.dataset.skin : 'nebula';
+      const frame = window.frameElement;
+      const full = frame && frame.closest && frame.closest('.device.immersive .win.full, body.desktop-fullscreen .win.full');
+      paint(skin, light ? 'light' : 'dark', full ? 'immersive' : 'window', {
+        base, chrome: read('sk-win', base),
+        surface: `color-mix(in srgb, ${ink} 6%, transparent)`,
+        'surface-raised': `color-mix(in srgb, ${ink} 10%, transparent)`,
+        text: ink, 'text-secondary': read('ink-2', light ? '#4a4538' : '#b9b0d8'), 'text-muted': read('ink-3', light ? '#6b6556' : '#a59abf'),
+        border: read('line-2', light ? 'rgba(40,30,10,.18)' : 'rgba(205,190,255,.24)'),
+        accent, 'accent-soft': `color-mix(in srgb, ${accent} 16%, transparent)`, 'on-accent': light ? '#fffdf8' : base
+      }, 'framed');
+    } catch (_e) { /* keep the standalone defaults */ }
+  };
+  if (framed) {
+    window.addEventListener('message', (e) => {
+      if (e.source !== window.parent || e.origin !== ORIGIN || !e.data || e.data.type !== 'wizard:appearance') return;
+      const a = e.data.appearance;
+      if (!a || a.version !== 1 || !Number.isSafeInteger(a.revision) || a.revision < themedRevision || !a.tokens ||
+          !['window', 'immersive'].includes(a.presentation) || !['light', 'dark'].includes(a.colorScheme) ||
+          !/^[a-z0-9-]{1,40}$/.test(a.skin || '') || !TOKENS.every((k) => isColor(a.tokens[k]))) return;
+      themedRevision = a.revision;
+      paint(a.skin, a.colorScheme, a.presentation, a.tokens, 'themed');
+      try { window.parent.postMessage({type: 'wizard:appearance:ack', version: 1, revision: a.revision}, ORIGIN); } catch (_e) {}
+    });
+    fromHost();
+    if (hostDoc) {
+      try {
+        new window.MutationObserver(fromHost).observe(hostDoc.documentElement, {attributes: true, attributeFilter: ['style', 'class', 'data-skin']});
+      } catch (_e) {}
+      window.addEventListener('resize', fromHost);
+    }
+    try { window.parent.postMessage({type: 'wizard:appearance:ready', version: 1, app: 'Secret Drop'}, ORIGIN); } catch (_e) {}
+  }
+})();
+(() => {
+  'use strict';
   const TOKEN_HEADER = 'X-Secret-Drop-Token';
   const MAX_VALUE_BYTES = 65536;
   const encoder = new TextEncoder();
@@ -115,13 +183,17 @@ CLIENT_SCRIPT = """(() => {
   const fieldsContainer = document.getElementById('fields');
   const submit = document.getElementById('submit');
   const countdown = document.getElementById('countdown');
+  const panel = document.getElementById('panel');
+  const stateMark = document.getElementById('state');
+  const lede = document.getElementById('lede');
   let finished = false;
   let progressLabel = 'Encrypting\\u2026';
   let fieldSpecs = [];
   let encryption = null;
 
-  const setFeedback = (message) => {
+  const setFeedback = (message, tone) => {
     feedback.textContent = message || '';
+    feedback.dataset.tone = tone || 'bad';
     feedback.hidden = !message;
   };
 
@@ -129,13 +201,17 @@ CLIENT_SCRIPT = """(() => {
     fieldsContainer.querySelectorAll('input').forEach((input) => { input.value = ''; });
   };
 
-  const finish = (title, message) => {
+  const finish = (title, message, tone) => {
     finished = true;
     clearInputs();
     form.hidden = true;
     countdown.hidden = true;
+    lede.hidden = true;
+    stateMark.dataset.tone = tone || 'bad';
+    stateMark.hidden = false;
+    panel.dataset.state = tone || 'bad';
     heading.textContent = title;
-    setFeedback(message);
+    setFeedback(message, 'done');
   };
 
   const startCountdown = (seconds) => {
@@ -146,6 +222,7 @@ CLIENT_SCRIPT = """(() => {
       const remaining = Math.max(0, Math.ceil((deadline - performance.now()) / 1000));
       const minutes = Math.floor(remaining / 60);
       countdown.textContent = `${minutes}:${String(remaining % 60).padStart(2, '0')}`;
+      countdown.classList.toggle('low', remaining <= 60);
       if (remaining <= 0) {
         finish('Expired', 'This Secret Drop link is no longer valid. Ask for a new one.');
         return;
@@ -283,6 +360,7 @@ CLIENT_SCRIPT = """(() => {
     submit.textContent = data.submit_label || 'Save';
     progressLabel = data.progress_label || 'Encrypting\\u2026';
     form.hidden = false;
+    lede.hidden = false;
     startCountdown(Number(data.expires_in_seconds || 0));
   }).catch(() => finish('Unavailable', 'A secure Secret Drop session could not be established.'));
 
@@ -299,7 +377,7 @@ CLIENT_SCRIPT = """(() => {
       values[spec.name] = input.value;
     }
     submit.disabled = true;
-    setFeedback(progressLabel);
+    setFeedback(progressLabel, 'info');
     let envelope;
     try {
       envelope = await encryptValues(values);
@@ -318,7 +396,7 @@ CLIENT_SCRIPT = """(() => {
       body: JSON.stringify(envelope)
     }).then(({ok, data}) => {
       if (ok) {
-        finish(data.result === 'discarded' ? 'Done' : 'Saved', data.note || '');
+        finish(data.result === 'discarded' ? 'Done' : 'Saved', data.note || '', data.result === 'discarded' ? 'info' : 'ok');
         return;
       }
       submit.disabled = false;
@@ -1401,6 +1479,74 @@ def ensure_usable(config: dict[str, Any], request_id: str, request: dict[str, An
         raise SecretDropError("This Secret Drop link has already been used.", HTTPStatus.CONFLICT)
 
 
+PAGE_STYLE = """
+:root{--ink:var(--wz-text,#f3efff);--ink-2:var(--wz-text-secondary,#b9b0d8);--ink-3:var(--wz-text-muted,#a59abf);
+--line-2:var(--wz-border,rgba(205,190,255,.24));--fill:color-mix(in srgb,var(--ink) 6%,transparent);
+--fill-2:color-mix(in srgb,var(--ink) 10%,transparent);--accent:var(--wz-accent,#b99bff);--on-accent:var(--wz-on-accent,#160b32);
+--accent-soft:var(--wz-accent-soft,rgba(143,99,255,.16));--base:var(--wz-base,#05030c);--danger:#ff8f8f;
+--r-field:14px;--r-btn:16px;--r-mark:18px;--ease:cubic-bezier(.2,.9,.25,1);
+--font:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",sans-serif;color-scheme:dark}
+@media (prefers-color-scheme:light){html:not([data-color-scheme]){--ink:#1a1933;--ink-2:#484560;--ink-3:#66617a;--line-2:#d4cfde;
+--accent:#6844aa;--on-accent:#fff;--accent-soft:rgba(104,68,170,.12);--base:#faf8fd;--danger:#b42318;color-scheme:light}}
+html[data-color-scheme="light"]{--danger:#b42318;color-scheme:light}
+html[data-skin="signal"]{--r-field:2px;--r-btn:2px;--r-mark:2px}
+html[data-skin="signal"] .brand,html[data-skin="signal"] .field-label,html[data-skin="signal"] .countdown,html[data-skin="signal"] .foot{font-family:ui-monospace,"SF Mono",Menlo,monospace;letter-spacing:.06em}
+*{box-sizing:border-box}[hidden]{display:none!important}
+html{-webkit-text-size-adjust:100%;-webkit-tap-highlight-color:transparent}
+body{margin:0;min-height:100svh;color:var(--ink);font:15px/1.45 var(--font);background:var(--base);-webkit-font-smoothing:antialiased}
+html[data-mode="standalone"] body,html:not([data-mode]) body{background:radial-gradient(120% 55% at 50% -12%,color-mix(in srgb,var(--accent) 20%,transparent),transparent 62%),var(--base)}
+html[data-mode="themed"] body{background:transparent}
+main{min-height:100svh;display:grid;place-items:center;padding:max(28px,env(safe-area-inset-top)) 22px max(28px,env(safe-area-inset-bottom))}
+.panel{width:min(100%,440px);animation:rise .36s var(--ease) both}
+.top{display:flex;align-items:center;gap:10px;min-height:32px}
+.brand{display:flex;align-items:center;gap:10px;font-size:13px;font-weight:700;color:var(--ink-2)}
+.brand b{color:var(--ink);font-weight:750}
+.sigil{width:32px;height:32px;flex:none;border-radius:10px;display:grid;place-items:center;background:var(--accent-soft);color:var(--accent)}
+html[data-skin="signal"] .sigil{border-radius:2px}
+.sigil svg{width:17px;height:17px}
+html[data-presentation="window"] .brand{display:none}
+.countdown{margin-left:auto;padding:4px 10px;border-radius:99px;background:var(--fill);color:var(--ink-2);font-size:12px;font-weight:700;font-variant-numeric:tabular-nums}
+html[data-skin="signal"] .countdown{border-radius:2px}
+.countdown.low{color:var(--danger);background:color-mix(in srgb,var(--danger) 14%,transparent)}
+.state{width:56px;height:56px;margin-top:40px;border-radius:var(--r-mark);display:grid;place-items:center;background:var(--accent-soft);color:var(--accent);animation:pop .42s var(--ease) both}
+.state svg{width:26px;height:26px}
+.state .bad,.state[data-tone="bad"] .ok{display:none}.state[data-tone="bad"] .bad{display:block}
+.state[data-tone="bad"]{background:color-mix(in srgb,var(--danger) 15%,transparent);color:var(--danger)}
+.state[data-tone="info"]{background:var(--fill-2);color:var(--ink-2)}
+h1{margin:40px 0 8px;font-size:clamp(26px,7vw,32px);line-height:1.12;letter-spacing:-.03em;font-weight:750;overflow-wrap:anywhere}
+.panel[data-state] h1{margin-top:20px}
+html[data-presentation="window"] h1{margin-top:20px}
+.lede{margin:0 0 24px;color:var(--ink-3);font-size:14px;line-height:1.5}
+.feedback{margin:0 0 16px;color:var(--danger);font-size:13.5px;line-height:1.45}
+.feedback[data-tone="info"]{color:var(--ink-2)}
+.feedback[data-tone="done"]{color:var(--ink-2);font-size:15px}
+.fields{display:grid;gap:16px}.field-row{display:grid;gap:8px}
+.field-label{font-size:11.5px;font-weight:800;letter-spacing:.12em;text-transform:uppercase;color:var(--ink-2)}
+.field{position:relative}
+input{width:100%;height:54px;border:1px solid var(--line-2);border-radius:var(--r-field);padding:0 54px 0 16px;background:var(--fill);color:var(--ink);font:inherit;font-size:16px;outline:0;transition:border-color .14s,background .14s,box-shadow .14s}
+input:focus{border-color:color-mix(in srgb,var(--accent) 70%,transparent);background:var(--fill-2);box-shadow:0 0 0 3px var(--accent-soft)}
+input:disabled{opacity:.55}
+.reveal{position:absolute;right:5px;top:5px;width:44px;height:44px;display:grid;place-items:center;border:0;border-radius:max(2px,calc(var(--r-field) - 4px));background:transparent;color:var(--ink-3);cursor:pointer}
+.reveal:hover{background:var(--fill-2);color:var(--ink)}.reveal svg{width:21px;height:21px}
+.reveal:focus-visible,.submit:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.submit{width:100%;height:52px;margin-top:22px;border:0;border-radius:var(--r-btn);background:var(--accent);color:var(--on-accent);font:inherit;font-size:15.5px;font-weight:750;cursor:pointer;transition:transform .14s,opacity .14s,filter .14s}
+.submit:hover{filter:brightness(1.07)}.submit:active{transform:scale(.985)}.submit:disabled{opacity:.45;cursor:progress;transform:none}
+.foot{display:flex;align-items:center;justify-content:center;gap:7px;margin:18px 0 0;color:var(--ink-3);font-size:12px}
+.foot svg{width:13px;height:13px;flex:none}
+.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+@keyframes rise{from{opacity:0;transform:translateY(8px)}}
+@keyframes pop{from{opacity:0;transform:scale(.82)}}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+@media (max-width:480px){main{place-items:start center;padding-top:max(40px,7svh)}}
+html[data-mode="framed"] main,html[data-mode="themed"] main{place-items:start center;padding-top:20px}
+"""
+LOCK_ICON = (
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" '
+    'stroke-linejoin="round" aria-hidden="true"><rect x="4.5" y="10.5" width="15" height="10" rx="2.5"/>'
+    '<path d="M8 10.5V7.8a4 4 0 0 1 8 0v2.7"/></svg>'
+)
+
+
 def build_app_shell() -> bytes:
     """Return the generic application shell. It carries no request-specific data."""
     document = f"""<!doctype html>
@@ -1410,32 +1556,21 @@ def build_app_shell() -> bytes:
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="robots" content="noindex,nofollow,noarchive">
 <meta name="referrer" content="no-referrer">
+<meta name="color-scheme" content="dark light">
 <title>Hermes Secret Drop</title>
-<style>
-:root{{--ink:#111;--muted:#737373;--line:#dedede;--soft:#f6f6f6;--bad:#b42318;--ok:#087f5b}}
-*{{box-sizing:border-box}}[hidden]{{display:none!important}}
-body{{margin:0;min-height:100svh;background:#fff;color:var(--ink);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}}
-main{{min-height:100svh;display:grid;place-items:center;padding:28px 20px}}
-.panel{{position:relative;width:min(100%,420px)}}
-.brand{{font-size:13px;font-weight:800;letter-spacing:-.01em}}.brand span{{color:var(--muted);font-weight:500}}
-.countdown{{position:absolute;top:0;right:0;color:var(--muted);font-size:12px;font-weight:600;font-variant-numeric:tabular-nums}}
-h1{{margin:52px 0 24px;font-size:clamp(27px,7vw,34px);line-height:1.12;letter-spacing:-.045em;font-weight:720}}
-.fields{{display:grid;gap:15px}}.field-row{{display:grid;gap:7px}}.field-label{{font-size:13px;font-weight:650;color:#333}}.field{{position:relative}}input{{width:100%;height:54px;border:1px solid var(--line);border-radius:12px;padding:0 52px 0 15px;background:#fff;color:var(--ink);font:inherit}}input:focus{{outline:2px solid #111;outline-offset:1px;border-color:#111}}input:disabled{{background:var(--soft);color:var(--muted)}}
-.reveal{{position:absolute;right:5px;top:5px;width:44px;height:44px;display:grid;place-items:center;border:0;border-radius:9px;background:transparent;color:#666;cursor:pointer}}.reveal:hover{{background:var(--soft);color:#111}}.reveal:focus-visible{{outline:2px solid #111}}.reveal svg{{width:21px;height:21px}}
-.submit{{width:100%;height:52px;margin-top:12px;border:0;border-radius:12px;background:#111;color:#fff;font:inherit;font-weight:700;cursor:pointer}}.submit:hover{{background:#2a2a2a}}.submit:focus-visible{{outline:2px solid #111;outline-offset:2px}}.submit:disabled{{background:#aaa;cursor:not-allowed}}
-.feedback{{margin:-10px 0 16px;color:var(--bad);font-size:13px;line-height:1.45}}
-.sr-only{{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}}
-@media(max-width:420px){{main{{place-items:start center;padding-top:max(48px,10svh)}}}}
-</style>
+<style>{PAGE_STYLE}</style>
 </head>
-<body><main><section class="panel">
-<div class="brand">Hermes <span>Secret Drop</span></div>
-<strong class="countdown" id="countdown" aria-label="Time remaining" aria-live="polite" hidden>15:00</strong>
+<body><main><section class="panel" id="panel">
+<header class="top"><div class="brand"><span class="sigil">{LOCK_ICON}</span><span><b>Hermes</b> Secret Drop</span></div>
+<strong class="countdown" id="countdown" aria-label="Time remaining" aria-live="polite" hidden>15:00</strong></header>
+<div class="state" id="state" hidden><svg class="ok" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 12.5 4.5 4.5L19 7.5"/></svg><svg class="bad" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" aria-hidden="true"><path d="M12 7v6.5"/><path d="M12 17.2v.1"/></svg></div>
 <h1 id="heading">Secret Drop</h1>
+<p class="lede" id="lede" hidden>Encrypted in this browser before it is sent. Write-only: once saved, it cannot be viewed here again.</p>
 <p class="feedback" id="feedback" role="alert" hidden></p>
 <form id="secret-form" autocomplete="off" hidden>
 <div class="fields" id="fields"></div>
 <button id="submit" class="submit" type="submit">Save</button>
+<p class="foot">{LOCK_ICON}<span>End-to-end encrypted &middot; one-time link</span></p>
 </form>
 </section></main><script>{CLIENT_SCRIPT}</script></body>
 </html>"""
@@ -1450,9 +1585,14 @@ def render_notice(title: str) -> bytes:
     safe_title = html.escape(title)
     document = f"""<!doctype html>
 <html lang="en">
-<head><meta charset="utf-8"><meta name="robots" content="noindex,nofollow,noarchive">
-<title>{safe_title} · Hermes Secret Drop</title></head>
-<body><main><h1>{safe_title}</h1></main></body>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="robots" content="noindex,nofollow,noarchive"><meta name="color-scheme" content="dark light">
+<title>{safe_title} · Hermes Secret Drop</title><style>{PAGE_STYLE}</style></head>
+<body><main><section class="panel">
+<header class="top"><div class="brand"><span class="sigil">{LOCK_ICON}</span><span><b>Hermes</b> Secret Drop</span></div></header>
+<h1>{safe_title}</h1>
+<p class="lede">Open the complete Secret Drop link you were sent.</p>
+</section></main></body>
 </html>"""
     return document.encode("utf-8")
 
