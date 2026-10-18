@@ -442,6 +442,36 @@ class BundleTests(SecretDropTestCase):
         self.assertIn("PROVIDER_API_KEY='api-value'", env_text)
         self.assertIn("PROVIDER_ACCOUNT_TOKEN='account-value'", env_text)
 
+    def test_paired_app_credentials_use_separate_labelled_fields(self):
+        created = secret_drop.create_bundle_request(
+            self.config,
+            "Telegram app credentials",
+            [
+                {"env_key": "TELEGRAM_API_ID", "label": "API ID", "validator": "opaque"},
+                {"env_key": "TELEGRAM_API_HASH", "label": "API hash", "validator": "opaque"},
+            ],
+            30,
+        )
+        capability = self.capability(created)
+        self.start_server()
+        status, body = self.get_metadata(capability)
+        self.assertEqual(status, 200)
+        self.assertIn("API ID", body.decode("utf-8"))
+        self.assertIn("API hash", body.decode("utf-8"))
+        envelope = self.encrypted_envelope(capability, {"secret_0": "1234567", "secret_1": "0123456789abcdef0123456789abcdef"})
+        status, _, _ = self.post_envelope(capability, envelope)
+        self.assertEqual(status, 200)
+        env_text = self.env.read_text(encoding="utf-8")
+        self.assertIn("TELEGRAM_API_ID='1234567'", env_text)
+        self.assertIn("TELEGRAM_API_HASH='0123456789abcdef0123456789abcdef'", env_text)
+
+    def test_identifier_suffixes_stay_scoped_to_paired_credentials(self):
+        for key in ("USER_ID", "SESSION_HASH", "PATH_ID"):
+            with self.assertRaises(Exception):
+                secret_drop.validate_env_key(key)
+        for key in ("TELEGRAM_API_ID", "TELEGRAM_API_HASH", "GOOGLE_CLIENT_ID"):
+            self.assertEqual(secret_drop.validate_env_key(key), key)
+
     def test_incomplete_bundle_does_not_write_or_consume(self):
         created = self.create_bundle()
         capability = self.capability(created)

@@ -76,6 +76,11 @@ SECRET_SUFFIXES = (
     "_URL",
     "_URI",
     "_CREDENTIAL",
+    # Paired app credentials (e.g. Telegram api_id + api_hash, OAuth client id + secret)
+    # are collected as separate labelled fields in one bundle, never joined with a colon.
+    "_API_ID",
+    "_API_HASH",
+    "_CLIENT_ID",
 )
 DANGEROUS_KEYS = {
     "BASH_ENV",

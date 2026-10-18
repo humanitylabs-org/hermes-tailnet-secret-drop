@@ -81,7 +81,9 @@ hermes-secret-drop create-bundle \
   --field PROVIDER_CLIENT_SECRET="Client secret"
 ```
 
-Send only `request_url`, and send it whole. On Cloudflare Access deployments the capability is in an exact path (`https://host/private/path/drop/…`) so authentication redirects and chat clients preserve it. The page removes that path from history with `history.replaceState`, then uses `X-Secret-Drop-Token` on same-origin API calls. Cloudflare can observe the initial capability path; only `SHA-256(capability)` is stored at the origin.
+Collect paired app credentials as separate labelled fields rather than asking the user to join them with a separator. Key names ending in `_API_ID`, `_API_HASH` and `_CLIENT_ID` are accepted for this, for example `--field TELEGRAM_API_ID="API ID" --field TELEGRAM_API_HASH="API hash"`.
+
+Send only `request_url`, and send it whole. The capability is in the fragment (`https://host/private/path/#token=…`), which browsers omit from request lines, proxy logs, and `Referer`. The page removes the fragment from history with `history.replaceState`, then uses `X-Secret-Drop-Token` on same-origin API calls. Only `SHA-256(capability)` is stored.
 
 `request_id` is that digest. It is safe for sanitized `status` checks and does not reveal the capability.
 
