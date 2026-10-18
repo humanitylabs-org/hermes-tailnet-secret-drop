@@ -7,6 +7,7 @@ import http.client
 import importlib.util
 import json
 import os
+import re
 import socket
 import stat
 import subprocess
@@ -144,8 +145,12 @@ class SecretDropTestCase(unittest.TestCase):
     def capability(created: dict) -> str:
         url = created["request_url"]
         self_test = urlsplit(url)
-        assert self_test.fragment.startswith("token=")
-        return self_test.fragment.split("=", 1)[1]
+        match = re.search(r"/drop/([A-Za-z0-9_-]{32,128})/?$", self_test.path)
+        if match:
+            return match.group(1)
+        assert self_test.query.startswith("token=")
+        assert not self_test.fragment
+        return self_test.query.split("=", 1)[1]
 
     def get_metadata(self, capability: str | None, origin: str | None = None):
         headers = {secret_drop.TOKEN_HEADER: capability} if capability is not None else {}
@@ -377,7 +382,7 @@ class CloudflareAccessTests(SecretDropTestCase):
         self.config = self.access_config()
         created = self.create(key="EXAMPLE_API_KEY", label="Example API key")
         capability = self.capability(created)
-        self.assertTrue(created["request_url"].startswith(self.ACCESS_BASE + "/#token="))
+        self.assertTrue(created["request_url"].startswith(self.ACCESS_BASE + "/drop/"))
         self.start_server()
         status, _, _ = self.http("GET", "/")
         self.assertEqual(status, 404)
@@ -385,6 +390,9 @@ class CloudflareAccessTests(SecretDropTestCase):
         self.assertEqual(status, 404)
         status, _, _ = self.http("GET", "/apps/hermes-secrets/")
         self.assertEqual(status, 200)
+        status, _, shell = self.http("GET", f"/apps/hermes-secrets/drop/{capability}")
+        self.assertEqual(status, 200)
+        self.assertIn(b"Hermes Secret Drop", shell)
         status, _, health = self.http("GET", "/apps/hermes-secrets/health")
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(health), {"status": "ok", "version": secret_drop.APP_VERSION})
@@ -434,6 +442,36 @@ class BundleTests(SecretDropTestCase):
         self.assertIn("PROVIDER_API_KEY='api-value'", env_text)
         self.assertIn("PROVIDER_ACCOUNT_TOKEN='account-value'", env_text)
 
+    def test_paired_app_credentials_use_separate_labelled_fields(self):
+        created = secret_drop.create_bundle_request(
+            self.config,
+            "Telegram app credentials",
+            [
+                {"env_key": "TELEGRAM_API_ID", "label": "API ID", "validator": "opaque"},
+                {"env_key": "TELEGRAM_API_HASH", "label": "API hash", "validator": "opaque"},
+            ],
+            30,
+        )
+        capability = self.capability(created)
+        self.start_server()
+        status, body = self.get_metadata(capability)
+        self.assertEqual(status, 200)
+        self.assertIn("API ID", body.decode("utf-8"))
+        self.assertIn("API hash", body.decode("utf-8"))
+        envelope = self.encrypted_envelope(capability, {"secret_0": "1234567", "secret_1": "0123456789abcdef0123456789abcdef"})
+        status, _, _ = self.post_envelope(capability, envelope)
+        self.assertEqual(status, 200)
+        env_text = self.env.read_text(encoding="utf-8")
+        self.assertIn("TELEGRAM_API_ID='1234567'", env_text)
+        self.assertIn("TELEGRAM_API_HASH='0123456789abcdef0123456789abcdef'", env_text)
+
+    def test_identifier_suffixes_stay_scoped_to_paired_credentials(self):
+        for key in ("USER_ID", "SESSION_HASH", "PATH_ID"):
+            with self.assertRaises(secret_drop.SecretDropError):
+                secret_drop.validate_env_key(key)
+        for key in ("TELEGRAM_API_ID", "TELEGRAM_API_HASH", "GOOGLE_CLIENT_ID"):
+            self.assertEqual(secret_drop.validate_env_key(key), key)
+
     def test_incomplete_bundle_does_not_write_or_consume(self):
         created = self.create_bundle()
         capability = self.capability(created)
@@ -458,16 +496,16 @@ class BundleTests(SecretDropTestCase):
 
 
 class CapabilityAndStorageTests(SecretDropTestCase):
-    def test_request_url_carries_the_capability_only_in_the_fragment(self):
+    def test_request_url_carries_the_capability_in_access_safe_path(self):
         created = self.create()
         url = created["request_url"]
         parsed = urlsplit(url)
         capability = self.capability(created)
-        self.assertEqual(url, f"{PUBLIC_BASE_URL}/#token={capability}")
-        self.assertEqual(parsed.path, "/")
+        self.assertEqual(url, f"{PUBLIC_BASE_URL}/drop/{capability}")
+        self.assertEqual(parsed.path, f"/drop/{capability}")
         self.assertEqual(parsed.query, "")
-        self.assertEqual(parsed.fragment, f"token={capability}")
-        self.assertNotIn(capability, f"{parsed.scheme}://{parsed.netloc}{parsed.path}{parsed.query}")
+        self.assertEqual(parsed.fragment, "")
+        self.assertNotIn(capability, f"{parsed.scheme}://{parsed.netloc}")
         self.assertTrue(secret_drop.TOKEN_RE.fullmatch(capability))
 
     def test_only_the_capability_digest_is_stored_on_disk(self):
@@ -1054,13 +1092,13 @@ class LifecycleTests(SecretDropTestCase):
         self.assertNotIn("capability", state)
         self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
 
-    def test_request_lifetime_defaults_to_two_hours(self):
+    def test_request_lifetime_defaults_to_twenty_four_hours(self):
         with self.assertRaises(secret_drop.SecretDropError):
-            self.create(ttl=121)
-        self.assertEqual(secret_drop.DEFAULT_TTL_MINUTES, 120)
-        self.assertEqual(secret_drop.MAX_TTL_MINUTES, 120)
+            self.create(ttl=1441)
+        self.assertEqual(secret_drop.DEFAULT_TTL_MINUTES, 1440)
+        self.assertEqual(secret_drop.MAX_TTL_MINUTES, 1440)
 
-    def test_private_deployment_can_raise_request_lifetime_cap(self):
+    def test_private_deployment_can_lower_request_lifetime_cap(self):
         self.config["max_ttl_minutes"] = 300
         created = self.create(ttl=300)
         self.assertEqual(created["status"], "pending")
@@ -1070,7 +1108,7 @@ class LifecycleTests(SecretDropTestCase):
     def test_configured_request_lifetime_cannot_exceed_hard_cap(self):
         self.config["max_ttl_minutes"] = secret_drop.HARD_MAX_TTL_MINUTES + 1
         with self.assertRaises(secret_drop.SecretDropError):
-            self.create(ttl=120)
+            self.create(ttl=1440)
 
     def test_write_only_http_flow_saves_once_then_destroys_link(self):
         created = self.create()

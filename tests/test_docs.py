@@ -31,10 +31,11 @@ class DocumentationTests(unittest.TestCase):
         self.assertIn("`google-calendar-ics` validator remains a generic URL/feed check", readme)
         self.assertIn("it contacts no provider", skill)
 
-    def test_documentation_explains_the_fragment_capability(self):
+    def test_documentation_explains_the_access_safe_capability(self):
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         security = (ROOT / "SECURITY.md").read_text(encoding="utf-8")
-        self.assertIn("#token=", readme)
+        self.assertIn("/drop/", readme)
+        self.assertNotIn("#token=", readme)
         self.assertIn("history.replaceState", readme)
         self.assertIn("X-Secret-Drop-Token", readme)
         self.assertIn("X-Secret-Drop-Token", security)

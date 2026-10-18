@@ -1,7 +1,7 @@
 ---
 name: hermes-tailnet-secret-drop
 description: Create private, one-time encrypted links so a user can enter agent credentials without pasting them into chat.
-version: 1.3.2
+version: 1.3.2-telos.2
 author: Humanity Labs
 license: MIT
 platforms: [linux]
@@ -43,8 +43,8 @@ hermes-secret-drop create \
 
 Use `--validator google-calendar-ics` only for a private Google Calendar ICS URL. Do not invent validator names. `--adapter` cannot be combined with `--key`, `--label`, or `--validator`; the adapter fixes all three.
 
-3. Send only the returned `request_url`, and send it complete. Everything after the `#` is the capability that opens the page; a truncated link will not work. Never ask the user to paste the value into chat, and never include the capability in a summary.
-4. Tell the user the link uses the installation's private delivery path, works once, and expires at the returned time. New WizardOS installations normally use Cloudflare Access and Tunnel; legacy/private-overlay installs may use Tailnet mode. The default lifetime is two hours and an operator may explicitly configure a cap of up to five hours. Do not claim it hides the credential from the Hermes host.
+3. Send only the returned `request_url`, as a raw URL on its own line. Its `/drop/...` path is the capability that opens the page; the app removes it from the address after loading. Never ask the user to paste the value into chat, and never include the capability in a summary.
+4. Tell the user the link uses the installation's private delivery path, works once, and expires at the returned time. James's deployment defaults to 24 hours; new WizardOS installations normally use Cloudflare Access and Tunnel, while legacy/private-overlay installs may use Tailnet mode. Do not claim it hides the credential from the Hermes host.
 5. Be accurate about what was verified. `opaque` checks only that the value is a safe, non-empty, single line; it contacts no provider. Claim a provider verified a key only when an adapter performed that check.
 6. Creating a new request for a key you already requested retires the older pending link for that key as `superseded`. Tell the user to use the newest link.
 7. After the user submits, check sanitized state with `hermes-secret-drop status <request-id>` if needed. The `request_id` is a one-way digest and is safe to keep; it is not the capability. Never inspect or print the stored value.
@@ -65,8 +65,8 @@ The demo accepts only a fake value. It discards the submitted value instead of w
 - The service supports loopback-only HTTP behind an exact Cloudflare Access/Tunnel route and legacy Tailnet-only HTTPS. It never uses Tailscale Funnel or a public origin listener.
 - The browser can submit one value but cannot list, retrieve, export, prefill, or reveal stored values.
 - The eye icon shows only the value currently typed in that browser.
-- A link is single-use. Deployments default to a two-hour lifetime and may explicitly configure a cap up to the hard maximum of five hours.
-- The link's capability sits only in the URL fragment, so it never reaches the server in a request line or a log. The service stores only its SHA-256 digest.
+- A link is single-use. James's deployment defaults to a 24-hour lifetime and allows operators to configure a shorter cap.
+- James's Cloudflare Access deployment carries the capability in the initial path so authentication redirects and chat clients preserve it, then removes it from the address after page load. Cloudflare may observe that routing metadata; the service stores only its SHA-256 digest and requires the capability in a fixed header for metadata and submission.
 - Active request metadata never stores the submitted secret or the capability. Used, expired, and superseded request files are retired automatically; short-lived tombstones preserve sanitized status only.
 - Before transmission, the browser encrypts all entered values with a fresh AES-256-GCM key, wraps that key with the host's RSA-OAEP/SHA-256 public key, and binds the ciphertext to the one-time capability digest. The server accepts no plaintext fallback.
 - Cloudflare may observe routing metadata, the capability header, and ciphertext in Access mode, but not the entered value during ordinary operation. Because Cloudflare serves the page code, a malicious edge remains able to substitute code; removing that last trust requires a pinned client or direct private overlay.

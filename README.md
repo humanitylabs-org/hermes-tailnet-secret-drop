@@ -4,7 +4,7 @@ A private, one-time, browser-encrypted credential handoff for Hermes Agent.
 
 Secret Drop lets a user enter one secret or an atomic bundle without pasting values into AI chat. New WizardOS installs use an exact Cloudflare Access application and Tunnel route to a loopback-only origin; Tailnet-only HTTPS remains available for legacy/private-overlay deployments.
 
-The capability lives only in the URL fragment, the service stores only its hash, and the browser encrypts values before transmission with a fresh AES-256-GCM key wrapped to the VPS's RSA-OAEP public key. The server accepts no plaintext fallback, never lists secrets, and cannot let an older link overwrite a newer request.
+The capability uses an Access-safe `/drop/...` path, the service stores only its hash, and the browser encrypts values before transmission with a fresh AES-256-GCM key wrapped to the VPS's RSA-OAEP public key. The page removes the capability path immediately after loading. The server accepts no plaintext fallback, never lists secrets, and cannot let an older link overwrite a newer request.
 
 ## Why it exists
 
@@ -81,7 +81,9 @@ hermes-secret-drop create-bundle \
   --field PROVIDER_CLIENT_SECRET="Client secret"
 ```
 
-Send only `request_url`, and send it whole. The capability is in the fragment (`https://host/private/path/#token=…`), which browsers omit from request lines, proxy logs, and `Referer`. The page removes the fragment from history with `history.replaceState`, then uses `X-Secret-Drop-Token` on same-origin API calls. Only `SHA-256(capability)` is stored.
+Collect paired app credentials as separate labelled fields rather than asking the user to join them with a separator. Key names ending in `_API_ID`, `_API_HASH` and `_CLIENT_ID` are accepted for this, for example `--field TELEGRAM_API_ID="API ID" --field TELEGRAM_API_HASH="API hash"`.
+
+Send only `request_url`, and send it whole. On Cloudflare Access deployments the capability is in an exact path (`https://host/private/path/drop/…`) so authentication redirects and chat clients preserve it. The page removes that path from history with `history.replaceState`, then uses `X-Secret-Drop-Token` on same-origin API calls. Cloudflare can observe the initial capability path; only `SHA-256(capability)` is stored at the origin.
 
 `request_id` is that digest. It is safe for sanitized `status` checks and does not reveal the capability.
 
@@ -97,7 +99,7 @@ API-key or account verification requires an adapter. The `google-calendar-ics` v
 
 ## Link lifecycle
 
-- Default lifetime: two hours; private operators may configure up to the five-hour package hard cap
+- Default and hard maximum: 24 hours; private operators may configure a shorter cap
 - Single use: a successful submission retires the active request
 - Supersession: a newer request retires older pending requests that overlap any destination key
 - Validation first: rejected values preserve the previous `.env` and keep the link reusable
@@ -140,6 +142,12 @@ Uninstall stops the service, removes its configured listener and active request 
 ## What changed in 1.3.2
 
 - A failed legacy Tailscale Serve cleanup is now retained as a minimal pending ownership record in the Cloudflare configuration. Every retry remains fail-closed until that exact predecessor route is verified absent or safely removed.
+
+James's `1.3.2-telos.1` deployment changes the request default and hard maximum to 24 hours. Single-use consumption, scoped supersession, Access authentication, browser encryption, and automatic expiry remain unchanged.
+
+`1.3.2-telos.4` wears the Wizard OS skin. Inside a Wizard window it follows the shell's Appearance v1 roles (Nebula, Grove, Tide, Ember, Signal) and live skin changes; as a plain tab it paints its own dark or light theme. Theme handling is colour-only and grants no capability.
+
+`1.3.2-telos.3` carries the one-time capability through Cloudflare Access as a path segment, then removes it from the browser address before accepting input. This avoids login redirects and chat clients dropping fragments or queries. The tradeoff is that Cloudflare can observe the capability in routing metadata until the page loads; Access authentication, one-time consumption, 24-hour expiry, and browser-side encryption still apply.
 
 ## What changed in 1.3.1
 
