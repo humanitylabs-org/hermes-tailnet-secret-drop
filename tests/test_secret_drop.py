@@ -467,7 +467,7 @@ class BundleTests(SecretDropTestCase):
 
     def test_identifier_suffixes_stay_scoped_to_paired_credentials(self):
         for key in ("USER_ID", "SESSION_HASH", "PATH_ID"):
-            with self.assertRaises(Exception):
+            with self.assertRaises(secret_drop.SecretDropError):
                 secret_drop.validate_env_key(key)
         for key in ("TELEGRAM_API_ID", "TELEGRAM_API_HASH", "GOOGLE_CLIENT_ID"):
             self.assertEqual(secret_drop.validate_env_key(key), key)
