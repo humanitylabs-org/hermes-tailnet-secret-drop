@@ -680,6 +680,7 @@ def load_config(path: Path) -> dict[str, Any]:
             )
     load_encryption_private_key(Path(config["encryption_key_path"]))
     configured_max_ttl_minutes(config)
+    configured_allowed_env_keys(config)
     return config
 
 
@@ -727,6 +728,34 @@ def validate_env_key(key: str) -> str:
     if not key.endswith(SECRET_SUFFIXES):
         raise SecretDropError("The environment key must clearly represent a secret, token, password, or private URL.")
     return key
+
+
+def configured_allowed_env_keys(config: dict[str, Any]) -> set[str] | None:
+    """Optional operator-owned destination policy; absent preserves legacy behavior.
+
+    Empty explicitly disables all real intake. Malformed policies fail closed.
+    No browser or request field may widen this service-level allowlist.
+    """
+    if "allowed_env_keys" not in config:
+        return None
+    raw = config["allowed_env_keys"]
+    if not isinstance(raw, list):
+        raise SecretDropError("Secret Drop destination policy is invalid.", HTTPStatus.INTERNAL_SERVER_ERROR)
+    allowed: set[str] = set()
+    for key in raw:
+        if not isinstance(key, str):
+            raise SecretDropError("Secret Drop destination policy is invalid.", HTTPStatus.INTERNAL_SERVER_ERROR)
+        validated = validate_env_key(key)
+        if key != validated or key in allowed:
+            raise SecretDropError("Secret Drop destination policy is invalid.", HTTPStatus.INTERNAL_SERVER_ERROR)
+        allowed.add(key)
+    return allowed
+
+
+def require_allowed_env_keys(config: dict[str, Any], keys: list[str] | set[str]) -> None:
+    allowed = configured_allowed_env_keys(config)
+    if allowed is not None and any(key not in allowed for key in keys):
+        raise SecretDropError("This Secret Drop service cannot deliver that credential.", HTTPStatus.FORBIDDEN)
 
 
 def validate_label(label: str) -> str:
@@ -1085,6 +1114,7 @@ def create_request(
     adapter: str | None = None,
 ) -> dict[str, Any]:
     key, label, validator, adapter = resolve_intake(key, label, validator, adapter, demo=demo)
+    require_allowed_env_keys(config, [key] if key else [])
     max_ttl_minutes = configured_max_ttl_minutes(config)
     if ttl_minutes < 1 or ttl_minutes > max_ttl_minutes:
         raise SecretDropError(f"Request lifetime must be between 1 and {max_ttl_minutes} minutes.")
@@ -1161,6 +1191,7 @@ def create_bundle_request(
                 "validator": validator,
             }
         )
+    require_allowed_env_keys(config, keys)
     max_ttl_minutes = configured_max_ttl_minutes(config)
     if ttl_minutes < 1 or ttl_minutes > max_ttl_minutes:
         raise SecretDropError(f"Request lifetime must be between 1 and {max_ttl_minutes} minutes.")
@@ -1409,6 +1440,7 @@ def consume_request(
         _, request = load_active_request(config, request_id)
         fields = request_fields(request)
         ensure_usable(config, request_id, request)
+        require_allowed_env_keys(config, [str(field["env_key"]) for field in fields if field.get("env_key")])
 
     if isinstance(submitted_values, str):
         if len(fields) != 1:
@@ -1439,6 +1471,7 @@ def consume_request(
         if request_fields(request) != fields:
             raise SecretDropError("This Secret Drop request changed while it was being verified.", HTTPStatus.CONFLICT)
         ensure_usable(config, request_id, request)
+        require_allowed_env_keys(config, [str(field["env_key"]) for field in fields if field.get("env_key")])
 
         try:
             retired = retire_request(config, path, request, "consumed")
