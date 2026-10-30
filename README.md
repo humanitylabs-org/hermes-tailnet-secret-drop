@@ -97,6 +97,32 @@ Validators:
 
 API-key or account verification requires an adapter. The `google-calendar-ics` validator remains a generic URL/feed check, while `opaque` contacts no provider. The browser cannot choose adapters, environment names, validators, destinations, commands, or file paths.
 
+## Host-service-only destinations
+
+An installation that keeps host services separate from a sealed agent can set
+`env_path` to its host-owned provider file and add an explicit key allowlist to
+the service config:
+
+```json
+{
+  "allowed_env_keys": ["TINFOIL_API_KEY"]
+}
+```
+
+This is a server/operator policy, not a field supplied by the browser. It gates
+single-key requests, provider adapters, bundles, and existing pending requests
+at submission (both before provider validation and under the final commit
+lock). Missing policy retains legacy behavior; an empty list rejects all real
+intake while leaving demo mode available. Malformed policies fail closed.
+
+Retire or finish all pending requests **before** changing `env_path`, then
+restart the service and verify a synthetic write against an isolated config.
+Do not silently redirect an agent credential request to a host provider file:
+label the installation/request as host-service-only, and use the managed agent
+login/credential flow for agent credentials. Restrict `ReadWritePaths` to the
+host destination's parent (atomic replacement needs directory access) and the
+service's state directory; remove the old agent-home write grant.
+
 ## Link lifecycle
 
 - Default and hard maximum: 24 hours; private operators may configure a shorter cap
